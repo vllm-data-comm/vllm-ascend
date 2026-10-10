@@ -16,6 +16,7 @@ from vllm.v1.core.sched.output import (
     LwdEmbedBatch,
     LwdUnembedBatch,
 )
+from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.distributed import (
     ensure_model_parallel_initialized,
@@ -200,7 +201,18 @@ class LwdEdgeWorker(NPUWorker):
                 sum(batch_meta.num_accept_tokens),
                 batch_meta.recv_num_elements,
             )
-            return self._execute_lwd_unembed(lwd_batch.seqno, batch_meta)
+            result = self._execute_lwd_unembed(lwd_batch.seqno, batch_meta)
+            # [Lwd][eos-trace] C 点:声明 accepted>0 却无 token 回填的行
+            # 留痕(与边侧 B 点按 down_seqno 配对;accepted=0 的行不产
+            # token 属合法,不计缺)
+            LwdControlDiag.trace_worker_missing_rows(
+                lwd_batch.seqno,
+                list(batch_meta.req_ids),
+                list(batch_meta.num_accept_tokens),
+                list(getattr(result, "req_ids", None) or []),
+                [list(t) for t in (getattr(result, "sampled_token_ids", None) or [])],
+            )
+            return result
 
         logger.debug(
             "[lwd-edge] unknown LWD batch type %r; nothing to do",
