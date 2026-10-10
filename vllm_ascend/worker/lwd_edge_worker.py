@@ -200,21 +200,7 @@ class LwdEdgeWorker(NPUWorker):
                 sum(batch_meta.num_accept_tokens),
                 batch_meta.recv_num_elements,
             )
-            result = self._execute_lwd_unembed(lwd_batch.seqno, batch_meta)
-            if getattr(batch_meta, "eos_discard", False):
-                # EOS 尾部收弃批(云标行集已全终结):张量在
-                # _execute_lwd_unembed 内已收下即弃(防 DOWN 通道断号),
-                # 此处直接返回空输出,行不进交付(token 无主,正常交付
-                # 必然出错)。exec future 路径要求非 None。
-                logger.info(
-                    "[Lwd][edge-worker] eos_discard batch: tensor recv'd "
-                    "and dropped, seqno=%d reqs=%d",
-                    lwd_batch.seqno, len(batch_meta.req_ids),
-                )
-                return ModelRunnerOutput(
-                    req_ids=[], req_id_to_index={}, sampled_token_ids=[]
-                )
-            return result
+            return self._execute_lwd_unembed(lwd_batch.seqno, batch_meta)
 
         logger.debug(
             "[lwd-edge] unknown LWD batch type %r; nothing to do",
