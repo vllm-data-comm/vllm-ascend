@@ -10,7 +10,7 @@ from types import SimpleNamespace as NS
 import torch
 
 ROOT = Path(__file__).resolve().parents[3]
-MODULE = ROOT / "vllm_ascend/worker/lwd_cloud/lwd_draft_cache.py"
+MODULE = ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_draft_cache.py"
 SPEC = importlib.util.spec_from_file_location("lwd_draft_cache", MODULE)
 module = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(module)
@@ -35,7 +35,7 @@ class TestLwdDraftCache(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Exercise the actual restore method without importing torch_npu/vLLM.
-        path = ROOT / "vllm_ascend/worker/lwd_cloud/lwd_cloud_model_runner.py"
+        path = ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_model_runner.py"
         tree = ast.parse(path.read_text())
         runner = next(n for n in tree.body if isinstance(n, ast.ClassDef))
         method = next(n for n in runner.body if isinstance(n, ast.FunctionDef) and n.name == "_lwd_restore_drafts")
@@ -122,7 +122,7 @@ class TestLwdDraftCache(unittest.TestCase):
         self.assertEqual(r.input_ids.gpu.tolist(), [99, 0, 0])
 
     def test_runner_hooks_snapshot_before_removal_and_restore_after_native_copy(self):
-        path = ROOT / "vllm_ascend/worker/lwd_cloud/lwd_cloud_model_runner.py"
+        path = ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_model_runner.py"
         tree = ast.parse(path.read_text())
         cls = next(n for n in tree.body if isinstance(n, ast.ClassDef))
         cls.body = [

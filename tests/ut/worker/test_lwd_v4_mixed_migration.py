@@ -35,7 +35,7 @@ def load_methods(path, names, base=object, **globals_):
     return namespace[cls.name]
 
 
-RUNNER = "worker/lwd_cloud/lwd_cloud_model_runner.py"
+RUNNER = "worker/lwd_cloud_model/lwd_cloud_model_runner.py"
 
 
 class TestHashTransport(unittest.TestCase):
@@ -311,7 +311,7 @@ class TestExternalEmbeddingSP(unittest.TestCase):
         main = load_methods(RUNNER, {"_model_forward"}, Base, **globals_)()
         main.supports_mm_inputs = False
         main.lwd_hash_state = None
-        mtp = load_methods("worker/lwd_cloud/lwd_mtp_proposer.py", {"_run_merged_draft"}, Base, **globals_)()
+        mtp = load_methods("worker/lwd_cloud_model/lwd_mtp_proposer.py", {"_run_merged_draft"}, Base, **globals_)()
         mtp.is_multimodal_model = False
         embeds = torch.arange(6).reshape(3, 2).float()
         positions = torch.arange(3)

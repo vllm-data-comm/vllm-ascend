@@ -18,21 +18,11 @@ from vllm.v1.core.sched.output import (
 )
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.outputs import ModelRunnerOutput
-from vllm.distributed import (
-    ensure_model_parallel_initialized,
-    init_distributed_environment,
-)
-from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
 from vllm_ascend import envs
-from vllm_ascend.batch_invariant import init_batch_invariance
-from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
-    init_lwd_ascend_model_parallel,
-)
-from vllm_ascend.distributed.lwd_comm.service import get_lwd_comm_service
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
+from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
 from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
-from vllm_ascend.worker.worker import NPUWorker
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -64,7 +54,7 @@ def compute_top_id_th(logits: torch.Tensor, token_id: int) -> int:
 
 
 # ---- edge worker ----
-class LwdEdgeWorker(NPUWorker):
+class LwdEdgeWorker(LwdWorkerBase):
     """LWD edge worker: embed (prefill) + unembed (token recovery) only."""
 
     def load_model(self) -> None:
@@ -97,45 +87,10 @@ class LwdEdgeWorker(NPUWorker):
             config.num_experts_per_tok, config.n_routed_experts,
         )
 
-    def _init_worker_distributed_environment(self) -> None:
-        """覆写原生入口(worker.py):ascend 侧并行组按 Lwd 布局构建。
-
-        vllm 侧分组由 parallel_state.initialize_model_parallel 的 Lwd
-        分支完成;ascend 侧原生 init_ascend_model_parallel 按 (dp, pp,
-        pcp, tp) 均匀网格切分,表达不了非对称边云拓扑,故以
-        init_lwd_ascend_model_parallel 替代(构建 MC2 等组后注入)。
-        其余步骤与原生 worker.py 保持一致。"""
-        init_batch_invariance()
-        init_distributed_environment(
-            self.parallel_config.world_size,
-            self.rank,
-            self.distributed_init_method,
-            self.local_rank,
-            "hccl",
-        )
-        ensure_model_parallel_initialized(
-            self.parallel_config.tensor_parallel_size,
-            self.parallel_config.pipeline_parallel_size,
-            self.parallel_config.prefill_context_parallel_size,
-            self.parallel_config.decode_context_parallel_size,
-        )
-        init_lwd_ascend_model_parallel(self.parallel_config)
-        ensure_ec_transfer_initialized(self.vllm_config)
-
-    def init_device(self):
-        # The duplex channels MUST be built here, never in ``__init__``.
-        # ``init_lwd_duplex_channels`` creates the two HCCL process groups
-        # (``dist.new_group``) and then warms them up with a two-sided P2P
-        # exchange (world barrier plus the edge/cloud isend/irecv pair), so it
-        # needs the distributed environment -- world group and PP group --
-        # which ``NPUWorker._init_worker_distributed_environment`` only builds
-        # inside ``init_device``.  The executor constructs the worker first and
-        # calls ``init_device`` afterwards, so running it from ``__init__``
-        # would trip the "group is not initialized" assertions; the two-sided
-        # warmup additionally requires both peers to reach it in the same fixed
-        # order, which only holds once every rank is past its distributed init.
+    def init_device(self) -> None:
+        # comm_service 与组网由基类 init_device 负责;双工通道时序注释见
+        # LwdWorkerBase._init_lwd_duplex_channels。
         super().init_device()
-        self.comm_service = get_lwd_comm_service()
         # 多模态缓存:req_id -> mm_features(带 data,首 chunk 随
         # scheduled_new_reqs 到达时登记,chunk 越过全部 mm 段或
         # finished_req_ids 时摘除;位置信息按请求);
@@ -143,18 +98,17 @@ class LwdEdgeWorker(NPUWorker):
         # encoder cache 同粒度——同图复用不重编;容量淘汰(FIFO),
         # 不随请求生命周期释放(首版引用计数方案在错峰首 chunk 下
         # 会在后继请求到达前误删共享条目,实测同图 30 并发仍全价编码)。
-        self._lwd_mm_features_dict: dict[str, list] = {}
+        self._lwd_mm_features_dict: dict[str, list["MultiModalFeatureSpec"]] = {}
         self._lwd_mm_hash_embeds: dict[str, object] = {}
 
-        from vllm_ascend.distributed import lwd_wire
-        lwd_wire.init_lwd_duplex_channels()
+        self._init_lwd_duplex_channels()
         logger.info(
             "[lwd-edge] worker ready: duplex channels (UP/DOWN) initialized "
             "on global rank=%d",
             self.rank,
         )
 
-    def compile_or_warm_up_model(self):
+    def compile_or_warm_up_model(self) -> "CompilationTimes":
         # LWD 边侧运行期 forward 被 LWD 流程劫持(execute_model 只走
         # embed/unembed 直调),模型级 warmup 与 cudagraph 捕获均用不到;
         # 且 0 层拓扑下 full-forward 会在 final norm 解包失败。整体跳过。
@@ -167,7 +121,9 @@ class LwdEdgeWorker(NPUWorker):
         """The LWD edge runs no attention/transformer, so it needs no KV cache."""
         return {}
 
-    def execute_model(self, scheduler_output: "SchedulerOutput"):
+    def execute_model(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> "ModelRunnerOutput | None":
         lwd_batch = scheduler_output.lwd_batch
         # 多模态缓存生命周期:请求完结(含 abort)即摘除其 mm 特征/
         # encoder 输出缓存,防跨请求泄漏(正常路径在 chunk 越过全部
@@ -330,7 +286,7 @@ class LwdEdgeWorker(NPUWorker):
     # Multimodal (image) merge helpers                                     #
     # ------------------------------------------------------------------ #
 
-    def _lwd_mm_encode_missing(self, req_ids: list) -> None:
+    def _lwd_mm_encode_missing(self, req_ids: "list[str]") -> None:
         """批级编码:聚合本批全部请求的缓存未命中特征,按 modality 一次
         组批过视觉塔,结果回填 mm_hash 缓存。
 
@@ -365,7 +321,7 @@ class LwdEdgeWorker(NPUWorker):
         from vllm.multimodal.utils import group_and_batch_mm_kwargs
 
         mm_kwargs = [(f.modality, f.data) for f in missing_features]
-        outputs_by_modality: dict[str, list] = {}
+        outputs_by_modality: dict[str, list[torch.Tensor]] = {}
         num_outputs = 0
         for modality, num_items, mm_kwargs_batch in group_and_batch_mm_kwargs(
             mm_kwargs,
@@ -399,7 +355,9 @@ class LwdEdgeWorker(NPUWorker):
             (time.monotonic() - _t_enc) * 1000,
         )
 
-    def _lwd_mm_encoder_outputs(self, req_id: str) -> list:
+    def _lwd_mm_encoder_outputs(
+        self, req_id: str
+    ) -> "list[tuple[PlaceholderRange, torch.Tensor]]":
         """视觉塔输出的只读视图:[(mm_position, embeds)]。
 
         编码已前移到批级(_lwd_mm_encode_missing,整批一次组批);本处
@@ -431,7 +389,9 @@ class LwdEdgeWorker(NPUWorker):
         (容量淘汰,见 _lwd_mm_encoder_outputs)。"""
         self._lwd_mm_features_dict.pop(req_id, None)
 
-    def _lwd_gather_chunk_mm(self, batch_meta: LwdEmbedBatch):
+    def _lwd_gather_chunk_mm(
+        self, batch_meta: LwdEmbedBatch
+    ) -> "tuple[list[torch.Tensor], torch.Tensor]":
         """按本 chunk 窗口收集 mm embeds 行 + 构造 is_multimodal 掩码。
 
         编码在切片之前批级完成(整批一次组批,见 _lwd_mm_encode_missing),
@@ -442,7 +402,7 @@ class LwdEdgeWorker(NPUWorker):
         请求的特征摘除。"""
         total = sum(len(t) for t in batch_meta.token_ids)
         is_mm = torch.zeros(total, dtype=torch.bool)
-        mm_embeds: list = []
+        mm_embeds: list[torch.Tensor] = []
         if len(batch_meta.prompt_offsets) != len(batch_meta.req_ids):
             return mm_embeds, is_mm
         self._lwd_mm_encode_missing(batch_meta.req_ids)

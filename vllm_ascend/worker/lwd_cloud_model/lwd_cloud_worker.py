@@ -21,75 +21,55 @@ import torch
 from vllm.logger import logger
 from vllm.v1.core.sched.output import GrammarOutput  # noqa: F401  (type)
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-from vllm.distributed import (
-    ensure_model_parallel_initialized,
-    init_distributed_environment,
-)
-from vllm.distributed.ec_transfer import ensure_ec_transfer_initialized
-
-from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.distributed.lwd_comm.future import LwdCommFuture
-from vllm_ascend.distributed.lwd_comm.lwd_parallel_init import (
-    init_lwd_ascend_model_parallel,
-)
 from vllm_ascend.distributed.lwd_comm.service import get_lwd_comm_service
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
 
 # ops 须先于 model_runner 链初始化，否则 device_op 与 ops 包循环导入
 #（对齐 worker.py 的导入顺序）
 import vllm_ascend.ops  # noqa: F401
-from vllm_ascend.worker.lwd_cloud.lwd_cloud_model_runner import LwdCloudModelRunner
+from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
+    LwdCloudModelRunner,
+)
+from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, hash_payload_numel
-from vllm_ascend.worker.worker import NPUWorker
 
 
-class LwdCloudWorker(NPUWorker):
-    """NPUWorker + LWD data-plane wiring (cloud side only).
+# Early-recv thread loop tuning: MQ dequeue timeout, backoff sleep after a
+# dequeue error, and the per-iteration sleep that caps CPU while the MQ
+# reader window spins.
+_LWD_EARLY_RECV_DEQUEUE_TIMEOUT_S = 0.0005
+_LWD_EARLY_RECV_ERROR_SLEEP_S = 0.01
+_LWD_EARLY_RECV_LOOP_SLEEP_S = 0.002
 
-    This subclass is selected by ``platform.py`` only when the LWD
-    deployment enables LWD on a cloud process, so no role/mode checks
-    are needed here — ``self.enable_lwd`` (set by NPUWorker.__init__
-    from vllm_config.lwd_config) is the single switch."""
 
-    def _init_worker_distributed_environment(self) -> None:
-        """覆写原生入口(worker.py):ascend 侧并行组按 Lwd 布局构建。
+class LwdCloudWorker(LwdWorkerBase):
+    """LwdWorkerBase + LWD data-plane wiring (cloud side only).
 
-        vllm 侧分组由 parallel_state.initialize_model_parallel 的 Lwd
-        分支完成;ascend 侧原生 init_ascend_model_parallel 按 (dp, pp,
-        pcp, tp) 均匀网格切分,表达不了非对称边云拓扑,故以
-        init_lwd_ascend_model_parallel 替代(构建 MC2 等组后注入)。
-        其余步骤与原生 worker.py 保持一致。"""
-        init_batch_invariance()
-        init_distributed_environment(
-            self.parallel_config.world_size,
-            self.rank,
-            self.distributed_init_method,
-            self.local_rank,
-            "hccl",
-        )
-        ensure_model_parallel_initialized(
-            self.parallel_config.tensor_parallel_size,
-            self.parallel_config.pipeline_parallel_size,
-            self.parallel_config.prefill_context_parallel_size,
-            self.parallel_config.decode_context_parallel_size,
-        )
-        init_lwd_ascend_model_parallel(self.parallel_config)
-        ensure_ec_transfer_initialized(self.vllm_config)
+    Selected by ``platform.py`` only when LWD is enabled on a cloud
+    process; the data-plane wiring below runs unconditionally."""
 
-    def init_device(self):
+    def _receive_pp_intermediate_tensors(
+        self, forward_pass: bool
+    ) -> "AsyncIntermediateTensors | None":
+        """LWD: the edge-cloud handoff rides the lwd UP/DOWN channels,
+        so the native PP p2p receive would block forever."""
+        return None
+
+    def init_device(self) -> None:
         super().init_device()
         # channel-global DOWN seqno counter (worker layer, send-time alloc)
         self._lwd_down_next_seqno = 0
         # req_id -> posted UP recv futures (consumed by the runner's device-side inject)
-        self._lwd_up_recv_futures: dict[str, list] = {}
+        self._lwd_up_recv_futures: dict[
+            int, tuple["LwdCommFuture | None", "LwdEmbedBatch"]
+        ] = {}
         # [Lwd][pre-recv] 提前收:端点 rank(= 唯一持跨机 P2P 通道的云 rank,
         # 与 lwd_wire 同款约定)才提前挂真实 irecv 并上报收完水位;其余 rank
         # 的数据在注入时刻由 TP 组内广播取到,既不挂 recv 也不上报。
         self._lwd_up_hidden_size = 0
         self._lwd_early_recv_endpoint = False
         self._init_lwd_early_recv_state()
-        if not self.enable_lwd:
-            return
         if self.use_v2_model_runner:
             # The LWD hooks live on the V1 model runner; the V2 runner
             # (separate class) lacks them entirely — fail fast at bring-up
@@ -106,9 +86,7 @@ class LwdCloudWorker(NPUWorker):
         self.model_runner = LwdCloudModelRunner(
             self.vllm_config, self.device, worker=self
         )
-        from vllm_ascend.distributed import lwd_wire
-
-        lwd_wire.init_lwd_duplex_channels()
+        self._init_lwd_duplex_channels()
         # 端点 rank 才有跨机通道:把它的提前收通信线程起起来(hint MQ 已由
         # 执行器在建 worker 之前建好并写进环境变量;done MQ 由本处建 writer,
         # handle 随 READY 握手回传引擎)。其余 rank 只登记"非端点"。
@@ -125,7 +103,7 @@ class LwdCloudWorker(NPUWorker):
             self._start_lwd_early_recv_thread()
         self._register_lwd_prompt_embeds_provider()
 
-    def load_model(self):
+    def load_model(self) -> None:
         """加载后打实际切片:层数/首末层名/pp 切层参数,启动期即可裁决
         半模型嫌疑(全量且从 layer 0 起 = 正常;减半/起始非 0 = pp 切错)。"""
         super().load_model()
@@ -152,17 +130,18 @@ class LwdCloudWorker(NPUWorker):
     # Engine step wiring                                                  #
     # ------------------------------------------------------------------ #
 
-    def execute_model(self, scheduler_output):
+    def execute_model(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> "ModelRunnerOutput | AsyncModelRunnerOutput | None":
         # [Lwd][perf] worker 开工时刻(与引擎 rpc-enqueue ts 对减 =
         # 下达-开工延迟;各卡开工离散 = 集合对齐成本)
         logger.info(
             "[Lwd][perf] worker-exec-start rank=%d ts=%.3f",
             self.rank, time.monotonic(),
         )
-        if self.enable_lwd:
-            # cloud: post the exact-size UP irecv for every incoming
-            # LWD_EMBED batch (control info rides scheduler_output.lwd_batch).
-            self._lwd_up_post_recvs(scheduler_output)
+        # cloud: post the exact-size UP irecv for every incoming
+        # LWD_EMBED batch (control info rides scheduler_output.lwd_batch).
+        self._lwd_up_post_recvs(scheduler_output)
 
         # cloud: finished requests trigger local cleanup (collector
         # bookkeeping + UP chunk table); finished_req_ids is the
@@ -181,7 +160,7 @@ class LwdCloudWorker(NPUWorker):
         )
         return output
 
-    def _lwd_up_post_recvs(self, scheduler_output) -> None:
+    def _lwd_up_post_recvs(self, scheduler_output: "SchedulerOutput") -> None:
         """Bind the UP recv for an incoming LWD_EMBED batch.
 
         UP 两段通信按 prefill_only_demo_br 范式拆到两个时刻:
@@ -276,7 +255,9 @@ class LwdCloudWorker(NPUWorker):
         # 已上报完成的 key
         self._early_recv_reported: set[tuple[LwdChannelType, int]] = set()
         # 名额已满时排队的提示(key -> hint,插入序即到达序)
-        self._early_recv_pending: dict[tuple[LwdChannelType, int], dict] = {}
+        self._early_recv_pending: dict[
+            tuple[LwdChannelType, int], "dict[str, Any]"
+        ] = {}
         # 队列卡住诊断的限频时间戳
         self._early_recv_stuck_log_at = 0.0
         # 下行提示 MQ(reader)/ 上行完成上报 MQ(writer)
@@ -357,14 +338,14 @@ class LwdCloudWorker(NPUWorker):
         while True:
             if hint_mq is not None:
                 try:
-                    hint = hint_mq.dequeue(timeout=0.0005)
+                    hint = hint_mq.dequeue(timeout=_LWD_EARLY_RECV_DEQUEUE_TIMEOUT_S)
                 except TimeoutError:
                     pass
                 except Exception:
                     # 关停时 ring 被取消等:记一条、小睡,别热转(daemon 线程
                     # 随进程退出)
                     logger.exception("[Lwd][pre-recv] hint MQ dequeue failed")
-                    time.sleep(0.01)
+                    time.sleep(_LWD_EARLY_RECV_ERROR_SLEEP_S)
                 else:
                     self.start_early_irecv(hint)
             self._report_irecv_completions()
@@ -372,7 +353,7 @@ class LwdCloudWorker(NPUWorker):
             # ring 读端在"刚读过"的时间窗内是 sched_yield 自旋(busy_loop_s=1s),
             # 光给 0.5ms 超时并不封顶 CPU —— 这行 sleep 才是封顶,代价是
             # 提示/水位各约 2ms 的可见延迟。
-            time.sleep(0.002)
+            time.sleep(_LWD_EARLY_RECV_LOOP_SLEEP_S)
 
     _LWD_EARLY_RECV_STUCK_LOG_INTERVAL_S = 5.0
 
@@ -405,7 +386,7 @@ class LwdCloudWorker(NPUWorker):
             oldest, len(holders), holders,
         )
 
-    def start_early_irecv(self, hint: dict) -> None:
+    def start_early_irecv(self, hint: "dict[str, Any]") -> None:
         """收下一条引擎提示;名额没满就立刻挂 recv,满了先排队。
 
         幂等:同一 (channel, seqno) 的重复提示、或消费点已经处理过的,都不再
@@ -570,47 +551,46 @@ class LwdCloudWorker(NPUWorker):
         # rank-replay DOWN:发送 hidden 包(通道异步、流内有序);pinned 视图
         # 挂输出内层(就绪由 get_output 的 wait_stream(主流) 保证),
         # 引擎侧解码发布 meta。
-        if self.enable_lwd:
-            payload = self.model_runner.take_lwd_pending_down_payload()
-            if payload is not None and output is not None:
-                hidden, pinned, _event, req_ids, _accepted = payload
-                seqno = self._lwd_next_down_seqno()
-                logger.info(
-                    "[Lwd][cloud-worker] DOWN send seqno=%d numel=%d",
-                    seqno, hidden.numel(),
+        payload = self.model_runner.take_lwd_pending_down_payload()
+        if payload is not None and output is not None:
+            hidden, pinned, _event, req_ids, _accepted = payload
+            seqno = self._lwd_next_down_seqno()
+            logger.info(
+                "[Lwd][cloud-worker] DOWN send seqno=%d numel=%d",
+                seqno, hidden.numel(),
+            )
+            get_lwd_comm_service().submit_send(
+                LwdCommRequest(
+                    channel=LwdChannelType.DOWN,
+                    op="send",
+                    num_elements=hidden.numel(),
+                    tensor=hidden,
+                    seqno=seqno,
                 )
-                get_lwd_comm_service().submit_send(
-                    LwdCommRequest(
-                        channel=LwdChannelType.DOWN,
-                        op="send",
-                        num_elements=hidden.numel(),
-                        tensor=hidden,
-                        seqno=seqno,
-                    )
-                )
-                # async 包装器下挂到内层,否则 get_output() 解包丢失
-                target = getattr(output, "_model_runner_output", output)
-                target.lwd_down_carrier = (
-                    pinned, req_ids, hidden.numel(), seqno
-                )
-                # [Lwd][perf] 云侧每步计时:sample=采样+采集(含秩计算);
-                # send=DOWN 提交(快照clone+isend+bridge wait);total=全步
-                logger.info(
-                    "[Lwd][perf] cloud-step seqno=%d sample=%.2f send=%.2f "
-                    "total=%.2fms rows=%d",
-                    seqno,
-                    (_t_sample - _t0) * 1000,
-                    (time.monotonic() - _t_sample) * 1000,
-                    (time.monotonic() - _t0) * 1000,
-                    hidden.shape[0] if hidden is not None else 0,
-                )
+            )
+            # async 包装器下挂到内层,否则 get_output() 解包丢失
+            target = getattr(output, "_model_runner_output", output)
+            target.lwd_down_carrier = (
+                pinned, req_ids, hidden.numel(), seqno
+            )
+            # [Lwd][perf] 云侧每步计时:sample=采样+采集(含秩计算);
+            # send=DOWN 提交(快照clone+isend+bridge wait);total=全步
+            logger.info(
+                "[Lwd][perf] cloud-step seqno=%d sample=%.2f send=%.2f "
+                "total=%.2fms rows=%d",
+                seqno,
+                (_t_sample - _t0) * 1000,
+                (time.monotonic() - _t_sample) * 1000,
+                (time.monotonic() - _t0) * 1000,
+                hidden.shape[0] if hidden is not None else 0,
+            )
         return output
 
     # ------------------------------------------------------------------ #
     # LWD housekeeping (control-plane glue)                               #
     # ------------------------------------------------------------------ #
 
-    def _lwd_cloud_flush_finished(self, finished_req_ids) -> None:
+    def _lwd_cloud_flush_finished(self, finished_req_ids: "list[str]") -> None:
         """Cloud side (streaming): a finished request's DOWN stream simply
         STOPS (its last step packet already went out with that step).
         No FIN packet -- request termination is signaled by the control
@@ -647,7 +627,7 @@ class LwdCloudWorker(NPUWorker):
 
         runner = self.model_runner
 
-        def _lwd_prompt_embeds_provider(req_id: str):
+        def _lwd_prompt_embeds_provider(req_id: str) -> "torch.Tensor | None":
             idx = runner.input_batch.req_id_to_index.get(req_id)
             if idx is None:
                 return None

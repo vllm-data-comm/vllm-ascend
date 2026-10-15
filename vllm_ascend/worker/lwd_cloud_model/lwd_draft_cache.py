@@ -10,10 +10,16 @@ class LwdDraftCache:
     Request object identity prevents reuse after a request ID is recycled.
     """
 
-    def __init__(self):
-        self.entries = {}
+    def __init__(self) -> None:
+        self.entries: "dict[str, tuple[CachedRequestState, torch.Tensor]]" = {}
 
-    def preserve(self, scheduler_output, requests, prev_map, drafts):
+    def preserve(
+        self,
+        scheduler_output: "SchedulerOutput",
+        requests: "dict[str, CachedRequestState]",
+        prev_map: "dict[str, int]",
+        drafts: "torch.Tensor | None",
+    ) -> None:
         cached = scheduler_output.scheduled_cached_reqs
         invalid = set(scheduler_output.finished_req_ids)
         invalid.update(scheduler_output.preempted_req_ids or ())
@@ -43,7 +49,9 @@ class LwdDraftCache:
         for req_id, index in departing:
             self.entries[req_id] = (requests[req_id], snapshot[index])
 
-    def take(self, req_id, state, length):
+    def take(
+        self, req_id: str, state: "CachedRequestState", length: int
+    ) -> "torch.Tensor | None":
         entry = self.entries.pop(req_id, None)
         if entry is None:
             return None

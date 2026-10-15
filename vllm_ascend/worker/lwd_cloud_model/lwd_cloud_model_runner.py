@@ -23,8 +23,8 @@ from vllm.logger import logger
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend import envs
-from vllm_ascend.worker.lwd_cloud.lwd_draft_cache import LwdDraftCache
-from vllm_ascend.worker.lwd_cloud.lwd_mtp_proposer import LwdMTPProposer
+from vllm_ascend.worker.lwd_cloud_model.lwd_draft_cache import LwdDraftCache
+from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
     hash_layer_count,
@@ -34,10 +34,21 @@ from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
 
 
+# Endpoint host-gate timeout for the UP harvest wait: exceeding it means the
+# matching isend never arrived (edge never posted or the wire stalled), so
+# fail loudly instead of waiting forever.
+_LWD_UP_HOST_GATE_TIMEOUT_S = 60.0
+
+
 class LwdCloudModelRunner(NPUModelRunner):
     """NPUModelRunner + prefill_only LWD cloud-side runner logic."""
 
-    def __init__(self, vllm_config, device, worker=None):
+    def __init__(
+        self,
+        vllm_config: "VllmConfig",
+        device: "torch.device",
+        worker: "LwdCloudWorker | None" = None,
+    ) -> None:
         super().__init__(vllm_config, device)
         self.worker = worker  # LwdCloudWorker ref (UP recv futures live there)
         self._lwd_pending_down_payload = None
@@ -79,7 +90,9 @@ class LwdCloudModelRunner(NPUModelRunner):
             self._lwd_hash_prompt_mask = torch.zeros(self.max_num_tokens, dtype=torch.bool, device=device)
             self._lwd_hash_token_ids = torch.zeros(self.max_num_tokens, dtype=torch.int64, device=device)
 
-    def _update_states(self, scheduler_output):
+    def _update_states(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> "Callable[[], None] | None":
         # Called inside synchronize_input_prep(), before remove_request()
         # destroys the previous mapping and before any new graph replay.
         if self._lwd_draft_cache is not None:
@@ -89,14 +102,17 @@ class LwdCloudModelRunner(NPUModelRunner):
             )
         return super()._update_states(scheduler_output)
 
-    def _prepare_input_ids(self, scheduler_output, num_reqs,
-                           total_num_scheduled_tokens, cu_num_tokens):
+    def _prepare_input_ids(self, scheduler_output: "SchedulerOutput",
+                           num_reqs: int,
+                           total_num_scheduled_tokens: int,
+                           cu_num_tokens: "np.ndarray") -> None:
         super()._prepare_input_ids(
             scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens,
         )
         self._lwd_restore_drafts(scheduler_output, num_reqs, cu_num_tokens)
 
-    def _lwd_restore_drafts(self, scheduler_output, num_reqs, cu_num_tokens):
+    def _lwd_restore_drafts(self, scheduler_output: "SchedulerOutput",
+                            num_reqs: int, cu_num_tokens: "np.ndarray") -> None:
         cache = self._lwd_draft_cache
         if cache is None or not cache.entries:
             return
@@ -127,7 +143,7 @@ class LwdCloudModelRunner(NPUModelRunner):
                 0, dst, torch.cat(rows).to(dtype=self.input_ids.gpu.dtype),
             )
 
-    def _get_drafter(self):
+    def _get_drafter(self) -> "SpecDecodeBaseProposer | None":
         """Use the LWD MTP embedding adapter only in prefill_only mode."""
         lwd_config = getattr(self.vllm_config, "lwd_config", None)
         if (
@@ -145,7 +161,10 @@ class LwdCloudModelRunner(NPUModelRunner):
     # embeddings arrive over the UP channel and must drive forward)        #
     # ------------------------------------------------------------------ #
 
-    def _prepare_inputs(self, scheduler_output, num_scheduled_tokens):
+    def _prepare_inputs(
+        self, scheduler_output: "SchedulerOutput",
+        num_scheduled_tokens: "np.ndarray",
+    ) -> "tuple[torch.Tensor, SpecDecodeMetadata | None]":
         """UP 收割与 mrope 写入在 super() 之前,embeds 覆写在之后。
 
         mrope 时序契约(多模态迁移复核发现的源分支缺陷修复):super()
@@ -188,7 +207,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             self._lwd_prepare_hash_batch(num_scheduled_tokens)
         return out
 
-    def _lwd_prepare_hash_batch(self, num_scheduled_tokens):
+    def _lwd_prepare_hash_batch(self, num_scheduled_tokens: "np.ndarray") -> None:
         """Skip remote expert staging for decode, preserving graph buffers."""
         num_reqs = self.input_batch.num_reqs
         counts = num_scheduled_tokens[:num_reqs]
@@ -213,7 +232,9 @@ class LwdCloudModelRunner(NPUModelRunner):
         self._lwd_hash_experts[:batch.shape[0]].copy_(batch)
         self._lwd_hash_prompt_mask[:mask.shape[0]].copy_(mask)
 
-    def _lwd_rebuild_is_token_ids_mask(self, num_scheduled_tokens) -> None:
+    def _lwd_rebuild_is_token_ids_mask(
+        self, num_scheduled_tokens: "np.ndarray"
+    ) -> None:
         """重建 prompt-embeds 分支的扁平 is_token_ids 掩码。
 
         根因(async spec decode 乐观值):runner 的 num_computed_tokens_cpu
@@ -252,7 +273,17 @@ class LwdCloudModelRunner(NPUModelRunner):
                 mask[off : off + prefill_rows] = False
             off += n
 
-    def _preprocess(self, scheduler_output, num_input_tokens, intermediate_tensors=None):
+    def _preprocess(
+        self, scheduler_output: "SchedulerOutput", num_input_tokens: int,
+        intermediate_tensors: "IntermediateTensors | None" = None,
+    ) -> tuple[
+        "torch.Tensor | None",
+        "torch.Tensor | None",
+        "torch.Tensor",
+        "IntermediateTensors | None",
+        "dict[str, Any]",
+        "ECConnectorOutput | None",
+    ]:
         """在异步投机位置修正后刷新 decode 掩码，再准备模型输入。"""
         if (self.use_async_spec_decode and self.enable_prompt_embeds
                 and intermediate_tensors is None and self.pcp_size == 1):
@@ -267,7 +298,16 @@ class LwdCloudModelRunner(NPUModelRunner):
             self.is_token_ids.np[:count] = self.is_token_ids.gpu[:count].cpu().numpy()
         return super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
 
-    def _lwd_preprocess_prompt_embeds(self, scheduler_output, num_input_tokens):
+    def _lwd_preprocess_prompt_embeds(
+        self, scheduler_output: "SchedulerOutput", num_input_tokens: int
+    ) -> tuple[
+        "torch.Tensor | None",
+        "torch.Tensor | None",
+        "torch.Tensor",
+        "IntermediateTensors | None",
+        "dict[str, Any]",
+        "ECConnectorOutput | None",
+    ]:
         """Consume the corrected device mask on the LWD cloud decoder path."""
         count = scheduler_output.total_num_scheduled_tokens
         is_token_ids = self.is_token_ids.gpu[:count]
@@ -295,7 +335,9 @@ class LwdCloudModelRunner(NPUModelRunner):
             None,
         )
 
-    def _lwd_refresh_decode_embedding_mask(self, scheduler_output):
+    def _lwd_refresh_decode_embedding_mask(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> None:
         """根据设备上的实际位置重建掩码，避免 decode 行复用旧 embedding。
 
         异步上传各请求的 prompt 长度，复用设备上的请求索引展开到 token 行。
@@ -314,14 +356,18 @@ class LwdCloudModelRunner(NPUModelRunner):
         self.is_token_ids.gpu[:count] = self.positions[:count] >= prompt_lens_rows
 
     # 在云侧模拟前向前清除真实批次标记，防止复用上次请求路由。
-    def _dummy_run(self, *args, **kwargs):
+    def _dummy_run(self, *args, **kwargs) -> None:
         """清除真实批次的 Hash 路由标记，再执行模拟前向。"""
         # 用空值表示尚未准备真实批次，区分 dummy 前向。
         self._lwd_hash_step_tokens = None
         return super()._dummy_run(*args, **kwargs)
 
-    def _model_forward(self, num_tokens_padded, input_ids=None, positions=None,
-                       intermediate_tensors=None, inputs_embeds=None, **model_kwargs):
+    def _model_forward(self, num_tokens_padded: int,
+                       input_ids: "torch.Tensor | None" = None,
+                       positions: "torch.Tensor | None" = None,
+                       intermediate_tensors: "IntermediateTensors | None" = None,
+                       inputs_embeds: "torch.Tensor | None" = None,
+                       **model_kwargs) -> "torch.Tensor":
         """按 SP 布局切分 embedding，并将完整 Hash 路由数据写入前向上下文。"""
         context = get_forward_context()
         if (inputs_embeds is not None and intermediate_tensors is None
@@ -396,7 +442,9 @@ class LwdCloudModelRunner(NPUModelRunner):
             if computed[idx] >= num_prompt[idx]:
                 embeds_map.pop(idx)
 
-    def _lwd_harvest_up_batches(self, num_scheduled_tokens) -> list:
+    def _lwd_harvest_up_batches(
+        self, num_scheduled_tokens: "np.ndarray"
+    ) -> "list[tuple[int, LwdEmbedBatch, torch.Tensor]]":
         """UP 批收割(super()._prepare_inputs 之前调用,时序契约见
         _prepare_inputs):端点过 host 门 + TP 组内现场广播收主帧
         embeds,完成窗口核验与 mrope 行写入 req_state(末 chunk 自推
@@ -449,7 +497,7 @@ class LwdCloudModelRunner(NPUModelRunner):
                 # 端点:先过 host 就绪门(demo 的 wait gate):done_event
                 # 轮询通过即 P2P 数据已完整落 buffer;超时显式报错而非
                 # 静默乱码。门通过后再广播,广播读到的必然是完整数据。
-                res = future.wait(timeout=60.0)
+                res = future.wait(timeout=_LWD_UP_HOST_GATE_TIMEOUT_S)
                 up_flat = res.tensor
                 if up_flat is None:
                     continue
@@ -556,7 +604,11 @@ class LwdCloudModelRunner(NPUModelRunner):
             harvested.append((batch_seqno, meta, up_flat))
         return harvested
 
-    def _lwd_inject_remote_embeds(self, harvested, num_scheduled_tokens) -> None:
+    def _lwd_inject_remote_embeds(
+        self,
+        harvested: "list[tuple[int, LwdEmbedBatch, torch.Tensor]] | None",
+        num_scheduled_tokens: "np.ndarray",
+    ) -> None:
         """Device-side inject(super() 之后):把收割到的 UP embeds 直写
         ``inputs_embeds.gpu`` 各请求的当步调度窗口。
 
@@ -682,7 +734,18 @@ class LwdCloudModelRunner(NPUModelRunner):
             )
         return cpu_ms, delta_ms
 
-    def _sample(self, logits, spec_decode_metadata):
+    def _pp_broadcast_prev_sampled_token_ids(
+        self, sampled_token_ids: "torch.Tensor"
+    ) -> None:
+        """LWD: token flow rides the lwd DOWN channel, skip the native PP broadcast."""
+
+    def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
+        """LWD: token flow rides the lwd UP channel, skip the native PP receive."""
+
+    def _sample(
+        self, logits: "torch.Tensor | None",
+        spec_decode_metadata: "SpecDecodeMetadata | None",
+    ) -> "SamplerOutput":
         """Capture the sampler output for the collect probe
         (the base sample_tokens clears execute_model_state on return)."""
         sampler_output = super()._sample(logits, spec_decode_metadata)
@@ -690,7 +753,7 @@ class LwdCloudModelRunner(NPUModelRunner):
         return sampler_output
 
     @torch.inference_mode()
-    def sample_tokens(self, grammar_output) -> ModelRunnerOutput:
+    def sample_tokens(self, grammar_output: "GrammarOutput | None") -> ModelRunnerOutput:
         from vllm.distributed.parallel_state import get_tp_group
 
         # 只有云 TP 组首卡(= DOWN 通道端点 rank)采集/发送;
@@ -724,7 +787,9 @@ class LwdCloudModelRunner(NPUModelRunner):
             )
         return output
 
-    def take_lwd_pending_down_payload(self):
+    def take_lwd_pending_down_payload(
+        self,
+    ) -> "tuple[torch.Tensor, torch.Tensor, None, list[str], None] | None":
         """worker 层取走本步 DOWN payload(单槽覆盖写,每步必被取走)。"""
         payload = getattr(self, "_lwd_pending_down_payload", None)
         self._lwd_pending_down_payload = None
@@ -732,9 +797,15 @@ class LwdCloudModelRunner(NPUModelRunner):
 
     @torch.inference_mode()
     def _lwd_collect_down_payload(
-        self, sample_hidden_states, logits, spec_decode_metadata,
-        scheduler_output, batch_req_ids, discard_mask_np, sampler_output,
-    ):
+        self,
+        sample_hidden_states: "torch.Tensor | None",
+        logits: "torch.Tensor | None",
+        spec_decode_metadata: "SpecDecodeMetadata | None",
+        scheduler_output: "SchedulerOutput",
+        batch_req_ids: "list[str]",
+        discard_mask_np: "np.ndarray",
+        sampler_output: "SamplerOutput",
+    ) -> "tuple[torch.Tensor, torch.Tensor, None, list[str], None] | None":
         """生产级 DOWN 采集(rank-replay):hidden 组包 + 全局秩 + num_accepted。
 
         廉价计算:bf16 直比(logits 原生 bf16,与 cast 后逐位等价)、
@@ -884,7 +955,7 @@ class LwdCloudModelRunner(NPUModelRunner):
             None,
         )
 
-    def _lwd_meta_pinned(self, n: int):
+    def _lwd_meta_pinned(self, n: int) -> "torch.Tensor":
         """轮换 pinned 缓冲(深度 4 > batch_queue 深度 2 + 引擎滞后 1):
         避免下一/N+2 步的边流拷贝覆盖引擎尚未读完的上一步 meta。"""
         ring = getattr(self, "_lwd_pinned_ring", None)

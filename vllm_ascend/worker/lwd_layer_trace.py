@@ -54,12 +54,16 @@ def _hidden_from(x: Any) -> Any:
     return None
 
 
-def _make_hook(label: str):
+def _make_hook(label: str) -> "Callable[..., None]":
     from vllm.logger import init_logger
 
     log = init_logger(__name__)
 
-    def hook(module, inputs, output):
+    def hook(
+        module: "torch.nn.Module",
+        inputs: "tuple[torch.Tensor, ...]",
+        output: "torch.Tensor | tuple[torch.Tensor, ...]",
+    ) -> None:
         if _state["step"] > _MAX_STEPS:
             return
         log.info(
@@ -72,12 +76,14 @@ def _make_hook(label: str):
     return hook
 
 
-def _make_step_hook():
+def _make_step_hook() -> "Callable[..., None]":
     from vllm.logger import init_logger
 
     log = init_logger(__name__)
 
-    def pre_hook(module, args):
+    def pre_hook(
+        module: "torch.nn.Module", args: "tuple[torch.Tensor, ...]"
+    ) -> None:
         _state["step"] += 1
         if _state["step"] <= _MAX_STEPS:
             log.info("[layer-trace] ==== forward step=%d ====", _state["step"])
@@ -85,7 +91,9 @@ def _make_step_hook():
     return pre_hook
 
 
-def _find_text_backbone(model):
+def _find_text_backbone(
+    model: "torch.nn.Module",
+) -> "tuple[torch.nn.Module | None, torch.nn.ModuleList | None]":
     """定位文本 backbone:兼容普通结构(model.model.layers)与 VL 包装
     结构(model.language_model[.model].layers,顶层是 visual+language_model)。
     返回 (backbone, layers);找不到返回 (None, None)。"""
@@ -106,7 +114,7 @@ def _find_text_backbone(model):
     return None, None
 
 
-def install_lwd_layer_trace(model) -> None:
+def install_lwd_layer_trace(model: "torch.nn.Module") -> None:
     """L0+L2:层数/结构日志 + 逐层 forward hook(幂等,env 门控)。
 
     覆盖 embed_tokens / decoder layers / final norm / lm_head;对拍时

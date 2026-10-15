@@ -13,14 +13,14 @@ class LwdMTPProposer(AscendEagleProposer):
 
     def _run_merged_draft(
         self,
-        num_input_tokens,
-        batch_size,
-        token_indices_to_sample,
-        target_positions,
-        inputs_embeds,
-        multi_steps_attn_metadata,
-        num_tokens,
-        is_prefill=None,
+        num_input_tokens: int,
+        batch_size: int,
+        token_indices_to_sample: "torch.Tensor | None",
+        target_positions: "torch.Tensor",
+        inputs_embeds: "torch.Tensor | None",
+        multi_steps_attn_metadata: "list[Any]",
+        num_tokens: int,
+        is_prefill: "bool | None" = None,
     ) -> torch.Tensor:
         """Shard external embeddings in the active draft context before forward."""
         context = get_forward_context()

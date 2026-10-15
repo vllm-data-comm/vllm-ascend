@@ -4,7 +4,7 @@
 import torch
 
 
-def hash_layer_count(config) -> int:
+def hash_layer_count(config: "PretrainedConfig") -> int:
     """返回 DeepSeek V4 的 Hash MoE 层数，其他模型返回零。"""
     return config.num_hash_layers if getattr(config, "model_type", None) == "deepseek_v4" else 0
 
@@ -27,7 +27,13 @@ def pack_hash_payload(embeds: torch.Tensor, expert_ids: torch.Tensor) -> torch.T
     return torch.cat((embeds.flatten(), encoded.to(embeds.device)))
 
 
-def unpack_hash_payload(payload, num_tokens, hidden_size, num_layers, top_k):
+def unpack_hash_payload(
+    payload: torch.Tensor,
+    num_tokens: int,
+    hidden_size: int,
+    num_layers: int,
+    top_k: int,
+) -> "tuple[torch.Tensor, torch.Tensor]":
     """校验并拆解载荷，返回原设备上的 embedding 和 CPU 上的 int32 专家 ID。"""
     expected = hash_payload_numel(num_tokens, hidden_size, num_layers, top_k)
     if payload.numel() != expected:
@@ -40,7 +46,12 @@ def unpack_hash_payload(payload, num_tokens, hidden_size, num_layers, top_k):
     return embeds, expert_ids.view(num_tokens, num_layers, top_k)
 
 
-def merge_hash_expert_ids(tid2eid, token_ids, prompt_experts, prompt_mask):
+def merge_hash_expert_ids(
+    tid2eid: torch.Tensor,
+    token_ids: torch.Tensor,
+    prompt_experts: torch.Tensor,
+    prompt_mask: torch.Tensor,
+) -> torch.Tensor:
     """Use remote IDs for prompt rows and checkpoint lookup for decode rows."""
     # The token buffer's prompt slots are intentionally unspecified. Never use
     # them as table indices, even in the unselected branch of torch.where.
@@ -52,7 +63,7 @@ def merge_hash_expert_ids(tid2eid, token_ids, prompt_experts, prompt_mask):
 class LwdHashRoutingState:
     """CPU prompt tables keyed by request ID, with explicit received-row masks."""
 
-    def __init__(self, num_layers: int, top_k: int, num_experts: int):
+    def __init__(self, num_layers: int, top_k: int, num_experts: int) -> None:
         """保存 Hash 路由维度，并初始化按请求管理的 prompt 专家 ID 缓存。"""
         self.num_layers = num_layers
         self.top_k = top_k
@@ -63,7 +74,9 @@ class LwdHashRoutingState:
         """释放指定请求的专家 ID 和有效位置标记；请求不存在时无需处理。"""
         self.requests.pop(req_id, None)
 
-    def add_chunk(self, req_id, prompt_len, start, expert_ids):
+    def add_chunk(
+        self, req_id: str, prompt_len: int, start: int, expert_ids: torch.Tensor
+    ) -> None:
         """校验远端专家 ID 分块，将其写入请求的绝对 prompt 位置并标记为有效。"""
         ids = expert_ids.to(device="cpu", dtype=torch.int32)
         if ids.ndim != 3 or tuple(ids.shape[1:]) != (self.num_layers, self.top_k):
@@ -83,7 +96,13 @@ class LwdHashRoutingState:
         entry[0][start:end].copy_(ids)
         entry[1][start:end] = True
 
-    def build_batch(self, req_ids, counts, computed, prompt_lengths):
+    def build_batch(
+        self,
+        req_ids: "Sequence[str]",
+        counts: "Sequence[int]",
+        computed: "Sequence[int]",
+        prompt_lengths: "Sequence[int]",
+    ) -> "tuple[torch.Tensor, torch.Tensor]":
         """按请求顺序和已计算位置组装 CPU 专家 ID 及 prompt 掩码，缺失 prompt 数据时报错。"""
         if not len(req_ids) == len(counts) == len(computed) == len(prompt_lengths):
             raise ValueError("LWD Hash routing batch metadata lengths do not match")

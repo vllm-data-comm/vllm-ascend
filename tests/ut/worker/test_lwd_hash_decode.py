@@ -21,7 +21,7 @@ class TestHashDecodeStaging(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         # Import the actual method without loading the NPU plugin.
-        path = ROOT / "vllm_ascend/worker/lwd_cloud/lwd_cloud_model_runner.py"
+        path = ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_model_runner.py"
         tree = ast.parse(path.read_text())
         runner = next(n for n in tree.body if isinstance(n, ast.ClassDef))
         method = next(n for n in runner.body if isinstance(n, ast.FunctionDef) and n.name == "_lwd_prepare_hash_batch")
