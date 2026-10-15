@@ -27,17 +27,14 @@ BASE_FILES = [
 ]
 
 # Allowlist pins the currently restored weave-ins (see ALLOWED below).
-# worker.py is now fully LWD-free (probes deleted, PP sunk via neutral
-# method extraction, role flags dead). model_runner_v1.py keeps only the
-# spec recovery chain (needs accepted-table lifecycle fix before sinking).
+# Both ascend base files are fully LWD-free. The spec recovery chain
+# (draft stash + accepted persist) was dead code in pdmix deployments
+# (LwdCloudScheduler defers prefill instead of evicting decode; the
+# PhaseScheduler experiment arm is the only consumer and is not used in
+# production). Any new weave-in fails immediately.
 ALLOWED = {
     "vllm_ascend/worker/worker.py": set(),
-    "vllm_ascend/worker/model_runner_v1.py": {
-        ("_prepare_inputs", "_lwd_spec_persist_enabled"),
-        ("propose_draft_token_ids", "_lwd_draft_stash"),
-        ("propose_draft_token_ids", "_lwd_spec_persist_enabled"),
-        ("propose_draft_token_ids", "getattr:_lwd_draft_cache"),
-    },
+    "vllm_ascend/worker/model_runner_v1.py": set(),
 }
 
 
