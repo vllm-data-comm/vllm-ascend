@@ -298,6 +298,32 @@ class LwdCloudModelRunner(NPUModelRunner):
             self.is_token_ids.np[:count] = self.is_token_ids.gpu[:count].cpu().numpy()
         return super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
 
+    def _resolve_prompt_embeds(
+        self, new_req_data: "NewRequestData"
+    ) -> "torch.Tensor | None":
+        """LWD: the edge-cloud transport carries shape only for all-zero
+        embeds buffers, so rebuild the local placeholder here (same
+        semantics as the engine-side torch.zeros)."""
+        if (
+            new_req_data.prompt_embeds is None
+            and new_req_data.prompt_embeds_shape is not None
+        ):
+            return torch.zeros(
+                new_req_data.prompt_embeds_shape,
+                dtype=new_req_data.prompt_embeds_dtype,
+            )
+        return new_req_data.prompt_embeds
+
+    def _should_run_mm_encoder(
+        self, is_first_rank: bool, is_encoder_decoder: bool
+    ) -> bool:
+        """LWD: batches carrying edge-provided embeds must not run the MM
+        encoder, or embeddings recomputed from input_ids would overwrite
+        the remote ones wholesale."""
+        if self.enable_prompt_embeds and bool(self.input_batch.req_prompt_embeds):
+            return False
+        return super()._should_run_mm_encoder(is_first_rank, is_encoder_decoder)
+
     def _lwd_preprocess_prompt_embeds(
         self, scheduler_output: "SchedulerOutput", num_input_tokens: int
     ) -> tuple[
