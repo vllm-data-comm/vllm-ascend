@@ -2392,10 +2392,8 @@ class NPUModelRunner(GPUModelRunner):
             # receive sampled token ids from the last PP rank when using
             # async scheduling + pipeline parallelism so downstream code
             # (e.g., PCP input preparation) can access them.
-            # LWD: 边云 token 流走 lwd 通道,不做 PP 组内的 token 广播。
             if (self.use_async_scheduling and pp.world_size > 1
-                    and not skip_pp_pd_broadcast
-                    and not self.parallel_config.lwd_config.enable_lwd):
+                    and not skip_pp_pd_broadcast):
                 self._pp_receive_prev_sampled_token_ids_to_input_batch()
             if not kv_connector_output:
                 return None  # noqa
@@ -2566,8 +2564,7 @@ class NPUModelRunner(GPUModelRunner):
         # last PP rank so other PP ranks can receive them without going
         # through the scheduler/engine IPC path.
         if self.use_async_scheduling:
-            if (pp.world_size > 1 and pp.is_last_rank and not skip_pp_pd_broadcast
-                    and not self.parallel_config.lwd_config.enable_lwd):
+            if (pp.world_size > 1 and pp.is_last_rank and not skip_pp_pd_broadcast):
                 self._pp_broadcast_prev_sampled_token_ids(sampler_output.sampled_token_ids)
 
         if not self.use_async_scheduling:
@@ -3819,11 +3816,6 @@ class NPUModelRunner(GPUModelRunner):
 
         if self.compilation_config.cudagraph_mode != CUDAGraphMode.NONE:
             self._start_dump_data()
-
-        # Lwd 逐层对拍插桩(env 门控,集中式/边云同路径;详见模块 docstring)
-        from vllm_ascend.worker.lwd_layer_trace import install_lwd_layer_trace
-
-        install_lwd_layer_trace(self.model)
 
         load_model_total_time = time.perf_counter() - load_model_start_time
         logger.info(
