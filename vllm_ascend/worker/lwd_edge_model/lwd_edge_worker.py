@@ -54,6 +54,13 @@ class LwdEdgeWorker(LwdWorkerBase):
     def load_model(self) -> None:
         """加载边侧模型，并为 DeepSeek V4 从权重文件读取 CPU Hash 路由表。"""
         super().load_model()
+        # [layer-trace] 对拍插桩(env 门控,缺省零开销):边侧安装点,
+        # 与云侧/集中式共用同一份代码(见 lwd_debug.lwd_layer_trace)。
+        from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
+            install_lwd_layer_trace,
+        )
+
+        install_lwd_layer_trace(self.model_runner.get_model())
         self.tid2eid_tables: list[torch.Tensor] = []
         config = self.model_config.hf_config
         if getattr(config, "model_type", None) != "deepseek_v4":
@@ -467,7 +474,7 @@ class LwdEdgeWorker(LwdWorkerBase):
             # L5 对拍:首行 top-20,与云侧 sampler 入口的 [layer-trace]
             # top20 逐位对照——排名换位即重放漂移的直接视图。
             try:
-                from vllm_ascend.worker.lwd_layer_trace import (
+                from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
                     lwd_layer_trace_enabled,
                 )
 

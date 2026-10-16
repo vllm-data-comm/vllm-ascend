@@ -105,6 +105,13 @@ class LwdCloudWorker(LwdWorkerBase):
         """加载后打实际切片:层数/首末层名/pp 切层参数,启动期即可裁决
         半模型嫌疑(全量且从 layer 0 起 = 正常;减半/起始非 0 = pp 切错)。"""
         super().load_model()
+        # [layer-trace] 对拍插桩(env 门控,缺省零开销):云侧安装点,
+        # 与边侧/集中式共用同一份代码(见 lwd_debug.lwd_layer_trace)。
+        from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
+            install_lwd_layer_trace,
+        )
+
+        install_lwd_layer_trace(self.model_runner.get_model())
         model = self.model_runner.get_model()
         backbone = getattr(model, "model", model)
         layers = getattr(backbone, "layers", None) or getattr(

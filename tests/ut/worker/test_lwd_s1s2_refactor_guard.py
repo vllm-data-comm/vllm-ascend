@@ -207,3 +207,19 @@ def test_finished_release_single_owner() -> None:
     assert "hash_state.discard" not in worker_src, (
         "release logic must live on the runner only"
     )
+
+def test_layer_trace_rehomed_and_installed() -> None:
+    """layer-trace 对拍插桩归位 lwd_debug 并恢复安装点。
+
+    c22c04b53 清基座探针时摘除了 NPUModelRunner.load_model 的安装调用
+    且无人接手,约 120 行 hook/校验和机制成为孤儿。现归位:边/云各自
+    load_model 安装(env 门控,缺省零开销);集中式对照臂为手动
+    opt-in(基类保持零 LWD 符号,weave guard 白名单为空)。
+    """
+    edge = _EDGE.read_text(encoding="utf-8")
+    worker = _WORKER.read_text(encoding="utf-8")
+    assert "install_lwd_layer_trace(self.model_runner.get_model())" in edge
+    assert "install_lwd_layer_trace(self.model_runner.get_model())" in worker
+    assert "vllm_ascend.worker.lwd_debug.lwd_layer_trace" in edge
+    assert (_REPO_ROOT / "vllm_ascend/worker/lwd_debug/lwd_layer_trace.py").exists()
+    assert not (_REPO_ROOT / "vllm_ascend/worker/lwd_layer_trace.py").exists()

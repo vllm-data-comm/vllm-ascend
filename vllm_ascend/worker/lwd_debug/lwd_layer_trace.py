@@ -5,8 +5,12 @@
 
 设计约束:
   * 集中式与边云必须走同一份插桩代码,插桩本身不得引入差异——
-    安装点在 NPUModelRunner.load_model(全部 runner 的公共基类路径),
-    环境变量 VLLM_ASCEND_LWD_LAYER_TRACE=1 门控,缺省零开销;
+    安装点在边/云各自的 load_model(边云臂自动;见 LwdEdgeWorker /
+    LwdCloudWorker),环境变量 VLLM_ASCEND_LWD_LAYER_TRACE=1 门控,
+    缺省零开销;
+  * 集中式对照臂为手动 opt-in:设同一环境变量后由驱动方调用
+    install_lwd_layer_trace(model)——基类 NPUModelRunner 保持零
+    LWD 符号,weave guard 白名单维持为空;
   * 只打校验和(numel/sum/abs_sum/max_abs/l2/head4),不打全量张量;
   * 只追踪前 _MAX_STEPS 个 model forward(prefill + 若干 decode),
     防止 decode 循环刷屏。
@@ -14,6 +18,7 @@
 """
 
 import os
+from collections.abc import Callable
 from typing import Any
 
 import torch
@@ -54,7 +59,7 @@ def _hidden_from(x: Any) -> Any:
     return None
 
 
-def _make_hook(label: str) -> "Callable[..., None]":
+def _make_hook(label: str) -> Callable[..., None]:
     from vllm.logger import init_logger
 
     log = init_logger(__name__)
@@ -76,7 +81,7 @@ def _make_hook(label: str) -> "Callable[..., None]":
     return hook
 
 
-def _make_step_hook() -> "Callable[..., None]":
+def _make_step_hook() -> Callable[..., None]:
     from vllm.logger import init_logger
 
     log = init_logger(__name__)
