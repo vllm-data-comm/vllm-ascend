@@ -3,6 +3,13 @@
 
 Run this file directly with a Python environment containing torch and numpy.
 These checks do not validate HCCL streams or NPU graph execution.
+
+对当关系(S1/S2 拆分与 mrope 控制面迁移后的刷新):meta 段核验 +
+张量段广播 = 原 _lwd_harvest_up_batches 单循环;fake worker 直接携带
+``_lwd_early_recv_endpoint``(端点判定单源契约,rank 重算已删);mrope
+positions 以控制面字节随 meta 到达(原数据面 aux 帧路径已退役,非端点
+rank 只有一次主帧广播)。方法注解里的协议名经 globals_ 注入占位,故
+runner 侧注解保持无引号。
 """
 
 import ast
@@ -12,6 +19,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace as NS
+from typing import NamedTuple
 from unittest.mock import patch
 
 import numpy as np
@@ -23,14 +31,21 @@ routing = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(routing)
 
 
-def load_methods(path, names, base=object, **globals_):
+def load_methods(path, names, base=object, extra_classes=(), **globals_):
     """Compile real methods with a stub base to isolate hardware dependencies."""
     tree = ast.parse((ROOT / path).read_text())
-    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef))
+    classes = [n for n in tree.body if isinstance(n, ast.ClassDef)]
+    cls = next(
+        node
+        for node in classes
+        if any(isinstance(m, ast.FunctionDef) and m.name in names for m in node.body)
+    )
     cls.bases = [ast.Name(id="Base", ctx=ast.Load())]
     cls.body = [node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name in names]
-    namespace = dict(Base=base, torch=torch, np=np, **globals_)
-    module = ast.fix_missing_locations(ast.Module(body=[cls], type_ignores=[]))
+    constants = [n for n in tree.body if isinstance(n, ast.Assign)]
+    helpers = [n for n in classes if n.name in extra_classes]
+    namespace = dict(Base=base, torch=torch, np=np, NamedTuple=NamedTuple, **globals_)
+    module = ast.fix_missing_locations(ast.Module(body=constants + helpers + [cls], type_ignores=[]))
     exec(compile(module, str(ROOT / path), "exec"), namespace)
     return namespace[cls.name]
 
@@ -134,28 +149,43 @@ class TestMixedInjection(unittest.TestCase):
         cls = load_methods(
             RUNNER,
             {
-                "_lwd_inject_remote_embeds",
-                "_lwd_harvest_up_batches",
-                "_lwd_inject_mrope_positions",
                 "_prepare_inputs",
+                "_lwd_harvest_up_batches",
+                "_lwd_stage_up_batch",
+                "_lwd_check_up_windows",
+                "_lwd_harvest_tensors_one",
+                "_lwd_hash_dims",
+                "_lwd_inject_remote_embeds",
+                "_lwd_inject_mrope_positions",
                 "_lwd_prepare_hash_batch",
             },
             base=Base,
+            extra_classes=("LwdUpStagedBatch",),
             time=time,
             logger=NS(info=lambda *args: None),
             hash_layer_count=routing.hash_layer_count,
             hash_payload_numel=routing.hash_payload_numel,
             unpack_hash_payload=routing.unpack_hash_payload,
+            # 方法注解里的协议名:裁剪命名空间无模块级导入,占位即可。
+            SchedulerOutput=object,
+            SpecDecodeMetadata=object,
+            LwdEmbedBatch=object,
+            LwdCommFuture=object,
         )
         self.runner = cls()
         self.embeds = torch.arange(8).reshape(4, 2).to(torch.bfloat16)
         self.ids = torch.arange(8).reshape(4, 1, 2).int()
         payload = routing.pack_hash_payload(self.embeds, self.ids)
-        self.meta = NS(req_ids=["b", "a"], token_ids=[[0, 0], [0, 0]], prompt_offsets=[0, 2], has_mrope=[False, False])
+        self.meta = NS(
+            req_ids=["b", "a"],
+            token_ids=[[0, 0], [0, 0]],
+            prompt_offsets=[0, 2],
+            has_mrope=[False, False],
+            mrope_positions=[b"", b""],
+        )
         self.result = NS(tensor=payload, aux_tensor=None)
         self.runner.worker = NS(
-            rank=1,
-            parallel_config=NS(lwd_config=NS(edge_npu_count=1)),
+            _lwd_early_recv_endpoint=True,
             _lwd_up_recv_futures={7: (NS(wait=lambda timeout: self.result), self.meta)},
         )
         self.runner.model_config = NS(
@@ -179,7 +209,6 @@ class TestMixedInjection(unittest.TestCase):
             "a": NS(mrope_positions=torch.zeros(3, 4, dtype=torch.int64)),
             "b": NS(mrope_positions=torch.zeros(3, 2, dtype=torch.int64)),
         }
-        self.runner._lwd_enabled = lambda: True
         self.runner._lwd_rebuild_is_token_ids_mask = lambda counts: None
         self.runner._lwd_release_consumed_prompt_embeds = lambda: None
 
@@ -213,19 +242,14 @@ class TestMixedInjection(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "chunk offset mismatch"):
             self.inject()
 
-    def test_mm_aux_is_visible_before_base_preparation(self):
-        self.runner.model_config.hf_config = NS(model_type="qwen2_5_vl")
-        self.runner.lwd_hash_state = None
-        self.result.tensor = self.embeds.flatten()
-        self.result.aux_tensor = torch.tensor([[3, 4, 5], [6, 7, 8]])
+    def test_control_plane_mrope_visible_before_base_preparation(self):
+        # b 的 mrope positions 以控制面字节随 meta 到达([3, n] int64);
+        # a 纯文本空字节,零路径变化。
+        positions = torch.tensor([[3, 6], [4, 7], [5, 8]], dtype=torch.int64)
+        self.meta.mrope_positions = [positions.numpy().tobytes(), b""]
         self.meta.has_mrope = [True, False]
         self.inject()
-        self.assertTrue(
-            torch.equal(
-                self.runner.positions_seen_by_base["b"],
-                self.result.aux_tensor.t(),
-            )
-        )
+        self.assertTrue(torch.equal(self.runner.positions_seen_by_base["b"], positions))
         self.assertFalse(self.runner.positions_seen_by_base["a"].any())
         self.assertEqual(self.runner.requests["b"].mrope_position_delta, 7)
         self.assertTrue(torch.equal(self.runner.inputs_embeds.gpu[:2], self.embeds[2:]))
@@ -243,7 +267,7 @@ class TestMixedInjection(unittest.TestCase):
         self.assertEqual(self.runner._lwd_hash_prompt_mask.tolist(), [True, True, False, False, True, True])
 
     def test_tp_receiver_allocates_complete_hash_payload(self):
-        self.runner.worker.rank = 2
+        self.runner.worker._lwd_early_recv_endpoint = False
         self.runner.worker._lwd_up_recv_futures[7] = (None, self.meta)
         native_empty = torch.empty
         sizes = []
@@ -265,14 +289,17 @@ class TestMixedInjection(unittest.TestCase):
         self.assertEqual(sizes, [routing.hash_payload_numel(4, 2, 1, 2)])
         self.assertTrue(torch.equal(self.runner._lwd_hash_experts[:2], self.ids[2:]))
 
-    def test_tp_receiver_preserves_separate_mm_aux_frame(self):
-        self.runner.worker.rank = 2
+    def test_tp_receiver_consumes_control_plane_mrope_only(self):
+        # 非端点 rank:广播只发生一次(主帧);mrope 走控制面字节,不再有
+        # 数据面 aux 帧(原 aux 帧路径已退役)。
+        self.runner.worker._lwd_early_recv_endpoint = False
         self.runner.worker._lwd_up_recv_futures[7] = (None, self.meta)
         self.runner.model_config.hf_config = NS(model_type="qwen2_5_vl")
         self.runner.lwd_hash_state = None
         self.meta.has_mrope = [False, True]
-        aux = torch.tensor([[3, 4, 5], [6, 7, 8]])
-        frames = iter([self.embeds.flatten(), aux.flatten()])
+        positions = torch.tensor([[3, 6], [4, 7], [5, 8]], dtype=torch.int64)
+        self.meta.mrope_positions = [b"", positions.numpy().tobytes()]
+        frames = iter([self.embeds.flatten()])
         events = []
         native_empty = torch.empty
 
@@ -291,8 +318,8 @@ class TestMixedInjection(unittest.TestCase):
             patch("torch.distributed.broadcast", side_effect=broadcast),
         ):
             self.inject(NS(world_size=2, ranks=[1, 2], device_group=object()))
-        self.assertEqual(events, [("launch", 8), ("wait", 8), ("launch", 6), ("wait", 6)])
-        self.assertTrue(torch.equal(self.runner.positions_seen_by_base["a"][:, 2:], aux.t()))
+        self.assertEqual(events, [("launch", 8), ("wait", 8)])
+        self.assertTrue(torch.equal(self.runner.positions_seen_by_base["a"][:, 2:], positions))
         self.assertFalse(self.runner.positions_seen_by_base["b"].any())
 
 

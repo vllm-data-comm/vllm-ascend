@@ -7,8 +7,9 @@ and model_runner files:
 - every named parameter and every return has a type annotation
 - no bare generic annotations (``dict``/``list``/``tuple``/``Callable``
   without type parameters)
-- function bodies stay within the 100-line budget (known exceptions are
-  tracked below until they are split)
+- function bodies stay within the 100-line budget (the former raised caps
+  for ``_lwd_harvest_up_batches``/``_lwd_collect_down_payload`` were
+  dropped once the S2 split landed)
 
 Pure AST scan over source files: no torch/NPU needed, runs on any checkout.
 """
@@ -30,20 +31,11 @@ LWD_WORKER_FILES = [
     "vllm_ascend/worker/lwd_cloud_model/lwd_mtp_proposer.py",
     "vllm_ascend/worker/lwd_cloud_model/lwd_draft_cache.py",
     "vllm_ascend/worker/lwd_base_model/lwd_worker_base.py",
+    "vllm_ascend/worker/lwd_base_model/lwd_pinned_staging.py",
     "vllm_ascend/worker/lwd_hash/lwd_hash_routing.py",
     "vllm_ascend/worker/lwd_hash/lwd_hash_tables.py",
     "vllm_ascend/worker/lwd_layer_trace.py",
 ]
-
-# TODO(ww): split these two along refactor candidates 1/2
-# (docs/lwd_worker_model_runner/LWD_worker_model_runner_重构设计.html);
-# drop the raised caps once the split lands.
-KNOWN_LONG_FUNCTIONS = {
-    "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_model_runner.py": {
-        "_lwd_harvest_up_batches": 161,
-        "_lwd_collect_down_payload": 158,
-    },
-}
 
 _BARE_GENERIC = re.compile(
     r"\b(Dict|List|Set|FrozenSet|Tuple|Callable|dict|list|set|frozenset|tuple)\b"
@@ -102,11 +94,9 @@ def test_no_bare_generic_annotations(rel_path: str) -> None:
 
 @pytest.mark.parametrize("rel_path", LWD_WORKER_FILES)
 def test_function_length_within_limit(rel_path: str) -> None:
-    allowed = KNOWN_LONG_FUNCTIONS.get(rel_path, {})
     problems: list[str] = []
     for fn in _functions(_parse(rel_path)):
         span = fn.end_lineno - fn.lineno + 1
-        cap = allowed.get(fn.name, 100)
-        if span > cap:
-            problems.append(f"{fn.name} {span}>{cap}")
+        if span > 100:
+            problems.append(f"{fn.name} {span}>100")
     assert not problems, "; ".join(problems)

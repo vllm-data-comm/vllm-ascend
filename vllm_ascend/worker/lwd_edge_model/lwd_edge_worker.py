@@ -20,6 +20,7 @@ from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm_ascend import envs
 from vllm_ascend.distributed.lwd_comm.types import LwdChannelType, LwdCommRequest
+from vllm_ascend.worker.lwd_base_model.lwd_pinned_staging import LwdPinnedStaging
 from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import pack_hash_payload
 from vllm_ascend.worker.lwd_hash.lwd_hash_tables import load_tid2eid_tables
@@ -44,13 +45,6 @@ def select_token_batch(
     _, sorted_idx = torch.sort(logits, dim=-1, descending=True)
     row = torch.arange(len(ranks), device=logits.device)
     return sorted_idx[row, torch.tensor(ranks, device=logits.device)].tolist()
-
-
-def compute_top_id_th(logits: torch.Tensor, token_id: int) -> int:
-    """Look up the descending-logits ordinal of ``token_id`` (cloud side)."""
-    logits = logits.reshape(-1)
-    order = torch.argsort(logits, descending=True)
-    return int((order == token_id).nonzero()[0].item())
 
 
 # ---- edge worker ----
@@ -182,27 +176,16 @@ class LwdEdgeWorker(LwdWorkerBase):
         同步拷贝——后者在主流上等设备排空(含上一块 chunk 的 UP send
         配对等待),把跨侧锁步传导进边 worker 主线程。同流序保证 embed
         kernel 读到的一定是本 chunk 的值(H2D 先于 embed 入队)。"""
-        n = len(flat_token_ids)
+        # 对当关系:LwdPinnedStaging.stage_to_device ≍ 原手写 pinned+device 4 槽对
+        # 轮换(容量下限 8192 同旧值)。
         ring = getattr(self, "_lwd_ids_ring", None)
-        if ring is None or ring[0][0].numel() < n:
-            m = max(n, 8192)
-            ring = [
-                (
-                    torch.empty(m, dtype=torch.int64, pin_memory=True),
-                    torch.empty(
-                        m, dtype=torch.int64, device=self.model_runner.device
-                    ),
-                )
-                for _ in range(4)
-            ]
+        if ring is None:
+            ring = LwdPinnedStaging(
+                dtype=torch.int64, min_capacity=8192,
+                device=self.model_runner.device,
+            )
             self._lwd_ids_ring = ring
-            self._lwd_ids_ring_idx = 0
-        idx = self._lwd_ids_ring_idx
-        self._lwd_ids_ring_idx = (idx + 1) % len(ring)
-        stage, dev = ring[idx]
-        stage.numpy()[:n] = flat_token_ids
-        dev[:n].copy_(stage[:n], non_blocking=True)
-        return dev[:n]
+        return ring.stage_to_device(flat_token_ids, len(flat_token_ids))
 
     @torch.inference_mode()
     def _execute_lwd_embed(

@@ -67,8 +67,6 @@ class LwdCloudWorker(LwdWorkerBase):
         # [Lwd][pre-recv] 提前收:端点 rank(= 唯一持跨机 P2P 通道的云 rank,
         # 与 lwd_wire 同款约定)才提前挂真实 irecv 并上报收完水位;其余 rank
         # 的数据在注入时刻由 TP 组内广播取到,既不挂 recv 也不上报。
-        self._lwd_up_hidden_size = 0
-        self._lwd_early_recv_endpoint = False
         self._init_lwd_early_recv_state()
         if self.use_v2_model_runner:
             # The LWD hooks live on the V1 model runner; the V2 runner
@@ -594,23 +592,27 @@ class LwdCloudWorker(LwdWorkerBase):
         """Cloud side (streaming): a finished request's DOWN stream simply
         STOPS (its last step packet already went out with that step).
         No FIN packet -- request termination is signaled by the control
-        plane (v2.6).  Here we drop the collector bookkeeping —
+        plane (v2.6).  Bookkeeping release lives on the runner
+        (``lwd_release_finished``, the single owner of the release path);
         finished_req_ids is the engine's own liveness signal, so this
-        cleanup does not depend on the control plane.  Also releases the
-        request's prompt-embeds assembly buffer (backstop for abort
-        mid-prefill; normal prefill completion frees it in the runner's
-        ``_lwd_release_consumed_prompt_embeds``)."""
-        embeds_map = self.model_runner.input_batch.req_prompt_embeds
-        req_id_to_index = self.model_runner.input_batch.req_id_to_index
+        cleanup does not depend on the control plane."""
         logger.info(
             "[Lwd][cloud-worker] flush finished reqs=%s", list(finished_req_ids)
         )
-        for req_id in finished_req_ids:
-            if self.model_runner.lwd_hash_state is not None:
-                self.model_runner.lwd_hash_state.discard(req_id)
-            idx = req_id_to_index.get(req_id)
-            if idx is not None:
-                embeds_map.pop(idx, None)
+        self.model_runner.lwd_release_finished(finished_req_ids)
+
+    def note_lwd_meta_ready(self) -> None:
+        """Record the DOWN meta readiness event on the worker.
+
+        The runner's collect path calls this right after queuing the
+        async pinned copy; the executor's response-enqueue path reads
+        ``worker._lwd_meta_ready_event`` and synchronizes on it before
+        the engine decodes the pinned meta (see vllm
+        multiproc_executor), which is why the event stays a worker
+        attribute rather than moving to the runner.
+        """
+        self._lwd_meta_ready_event = torch.npu.Event()
+        self._lwd_meta_ready_event.record()
 
     def _register_lwd_prompt_embeds_provider(self) -> None:
         """Wire the draft proposer's first-pass prompt-embeds provider.
