@@ -29,7 +29,6 @@ LWD_WORKER_FILES = [
     "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_worker.py",
     "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_model_runner.py",
     "vllm_ascend/worker/lwd_cloud_model/lwd_mtp_proposer.py",
-    "vllm_ascend/worker/lwd_cloud_model/lwd_draft_cache.py",
     "vllm_ascend/worker/lwd_base_model/lwd_worker_base.py",
     "vllm_ascend/worker/lwd_base_model/lwd_pinned_staging.py",
     "vllm_ascend/worker/lwd_hash/lwd_hash_routing.py",

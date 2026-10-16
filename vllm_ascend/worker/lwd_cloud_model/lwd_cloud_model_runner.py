@@ -25,7 +25,6 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend import envs
 from vllm_ascend.worker.lwd_base_model.lwd_pinned_staging import LwdPinnedStaging
-from vllm_ascend.worker.lwd_cloud_model.lwd_draft_cache import LwdDraftCache
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
@@ -90,12 +89,6 @@ class LwdCloudModelRunner(NPUModelRunner):
         super().__init__(vllm_config, device)
         self.worker = worker  # LwdCloudWorker ref (UP recv futures live there)
         self._lwd_pending_down_payload = None
-        self._lwd_draft_cache = (
-            LwdDraftCache()
-            if self.use_async_scheduling and self.speculative_config is not None
-            and self.speculative_config.method == "mtp"
-            and self.pcp_size == 1 and self.dcp_size == 1 else None
-        )
         # Stage per-request prompt lengths for device-side mask refresh.
         if self.use_async_spec_decode and self.enable_prompt_embeds:
             self._lwd_prompt_lens_gpu = torch.zeros(
@@ -126,59 +119,6 @@ class LwdCloudModelRunner(NPUModelRunner):
             )
             self._lwd_hash_prompt_mask = torch.zeros(self.max_num_tokens, dtype=torch.bool, device=device)
             self._lwd_hash_token_ids = torch.zeros(self.max_num_tokens, dtype=torch.int64, device=device)
-
-    def _update_states(
-        self, scheduler_output: "SchedulerOutput"
-    ) -> "Callable[[], None] | None":
-        # Called inside synchronize_input_prep(), before remove_request()
-        # destroys the previous mapping and before any new graph replay.
-        if self._lwd_draft_cache is not None:
-            self._lwd_draft_cache.preserve(
-                scheduler_output, self.requests,
-                self.input_batch.prev_req_id_to_index, self._draft_token_ids,
-            )
-        return super()._update_states(scheduler_output)
-
-    def _prepare_input_ids(self, scheduler_output: "SchedulerOutput",
-                           num_reqs: int,
-                           total_num_scheduled_tokens: int,
-                           cu_num_tokens: "np.ndarray") -> None:
-        super()._prepare_input_ids(
-            scheduler_output, num_reqs, total_num_scheduled_tokens, cu_num_tokens,
-        )
-        self._lwd_restore_drafts(scheduler_output, num_reqs, cu_num_tokens)
-
-    def _lwd_restore_drafts(self, scheduler_output: "SchedulerOutput",
-                            num_reqs: int, cu_num_tokens: "np.ndarray") -> None:
-        cache = self._lwd_draft_cache
-        if cache is None or not cache.entries:
-            return
-        rows, indices = [], []
-        for idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
-            if req_id not in cache.entries:
-                continue
-            tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id, ())
-            row = cache.take(req_id, self.requests[req_id], len(tokens))
-            # Consume the generation even when the scheduler drops all drafts.
-            if not tokens or self.prev_positions.np[idx] >= 0:
-                continue
-            if row is None:
-                raise RuntimeError(f"LWD draft snapshot is invalid for {req_id}")
-            end = int(cu_num_tokens[idx])
-            begin = int(cu_num_tokens[idx - 1]) if idx else 0
-            if end - begin < len(tokens) + 1:
-                raise RuntimeError(f"LWD draft segment is too short for {req_id}")
-            rows.append(row)
-            indices.extend(range(end - len(tokens), end))
-        if rows:
-            # Same stream as native input assembly and subsequent metadata /
-            # embedding construction. No device-to-host copy or host wait.
-            dst = torch.tensor(indices, dtype=torch.int64, pin_memory=self.pin_memory).to(
-                self.device, non_blocking=True,
-            )
-            self.input_ids.gpu.scatter_(
-                0, dst, torch.cat(rows).to(dtype=self.input_ids.gpu.dtype),
-            )
 
     def _get_drafter(self) -> "SpecDecodeBaseProposer | None":
         """Use the LWD MTP embedding adapter only in prefill_only mode."""

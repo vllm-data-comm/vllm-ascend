@@ -87,6 +87,28 @@ def test_no_is_lwd_gates_inside_lwd_runner() -> None:
     assert 'getattr(self.vllm_config, "lwd_config", None)' not in src
 
 
+def test_draft_cache_weave_removed() -> None:
+    """LwdDraftCache 删除守卫(与基类 spec recovery chain 删除同款论证)。
+
+    pdmix 现行线上恢复路径零消费:decode 不被驱逐(prefill notify 整批
+    defer)、原生 max_tokens 守卫是 depart-and-finish(请求必然完结,
+    不产生回归步)、V2 节拍守卫在云侧(V1 强制)是死路。删除后云
+    runner 的投机路径全原生(_update_states/_prepare_input_ids 不再
+    覆写)。若相位臂(phase_scheduler)重新接线,须连同"离批草稿
+    保管"机制一并恢复。
+    """
+    runner_src = _RUNNER.read_text(encoding="utf-8")
+    for symbol in ("LwdDraftCache", "_lwd_draft_cache", "_lwd_restore_drafts"):
+        assert symbol not in runner_src, f"draft-cache weave leaked back: {symbol}"
+    for override in ("def _update_states(", "def _prepare_input_ids("):
+        assert override not in runner_src, (
+            f"native {override[4:-1]} must stay unoverridden on the cloud runner"
+        )
+    assert not (
+        _REPO_ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_draft_cache.py"
+    ).exists(), "deleted module must not come back"
+
+
 def test_pinned_staging_single_implementation() -> None:
     runner = _RUNNER.read_text(encoding="utf-8")
     edge = _EDGE.read_text(encoding="utf-8")
