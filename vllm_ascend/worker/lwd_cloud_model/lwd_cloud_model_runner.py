@@ -268,7 +268,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     ]:
         """Refresh the decode mask after the async speculative-position fix, then prepare model inputs."""
         if (self.use_async_spec_decode and self.enable_prompt_embeds
-                and intermediate_tensors is None and self.pcp_size == 1):
+                and intermediate_tensors is None
+                and (self.vllm_config.parallel_config.prefill_context_parallel_size
+                     == 1)):
             self._lwd_refresh_decode_embedding_mask(scheduler_output)
             if (get_pp_group().is_first_rank
                     and not self.model_config.is_encoder_decoder
@@ -425,8 +427,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                        **model_kwargs) -> "torch.Tensor":
         """Shard embeddings per the SP layout and publish the full Hash routing data into the forward context."""
         context = get_forward_context()
+        # flash_comm_v1_enabled is only set by the SP fast path; without SP
+        # (the LWD 1+8 TP layout) it is absent and the sharding is skipped.
         if (inputs_embeds is not None and intermediate_tensors is None
-                and context.flash_comm_v1_enabled and not self.supports_mm_inputs):
+                and getattr(context, "flash_comm_v1_enabled", False)
+                and not self.supports_mm_inputs):
             # Passing embeddings directly bypasses the native embedding layer; re-apply the sequence split here.
             tp_group = get_tp_group()
             if tp_group.world_size > 1:

@@ -14,6 +14,7 @@ Selected via ``parallel_config.worker_cls`` (see platform.py:
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 
@@ -49,6 +50,79 @@ class LwdCloudWorker(LwdWorkerBase):
     Selected by ``platform.py`` only when LWD is enabled on a cloud
     process; the data-plane wiring below runs unconditionally."""
 
+
+    # 2026-10-20 aivec 事故观测探针(在 WORKER 进程——此前装在引擎进程,
+    # 内核在 worker 跑,探针什么都看不到):记录分箱内核每次发射的
+    # shape/stride/ptr/vocab/min/max(预算内),越界值升 WARNING 并转储样本。
+    # 根因定位后整体删除。
+    _LWD_SAMPLER_PROBE_BUDGET = int(os.getenv("VLLM_LWD_SAMPLER_PROBE_BUDGET", "200"))
+
+    @classmethod
+    def _lwd_install_sampler_probe(cls) -> None:
+        """Idempotent per worker process; patches the penalty kernel entry."""
+        import vllm_ascend.ops.triton.penalty as penalty_mod
+        from vllm_ascend.sample import sampler as sampler_mod
+
+        if getattr(penalty_mod, "_lwd_probe_installed", False):
+            return
+        penalty_mod._lwd_probe_installed = True
+
+        budget = {"left": cls._LWD_SAMPLER_PROBE_BUDGET}
+        orig_entry = penalty_mod.get_token_bin_counts_and_mask_triton
+
+        def probed_entry(tokens, vocab_size, num_seqs=None):
+            # 2026-10-20 MTE 复现实验:去掉 launch 前的 min()/.max()/.item()
+            # 设备读取——那是 D2H 同步点,会排空设备队列、关掉 async 占位
+            # 覆写的竞态窗口,疑似掩盖 bincount 负偏移 fault(现在复现不出
+            # 来)。只留宿主侧元数据行(零设备读),值检查待实验定论后按需
+            # 恢复。
+            lwd_logger.info(
+                "[LWD][sampler-probe] bincount launch shape=%s stride=%s "
+                "ptr=0x%x vocab=%d num_seqs=%s",
+                tuple(tokens.shape), tokens.stride(),
+                tokens.data_ptr(), vocab_size, num_seqs,
+            )
+            return orig_entry(tokens, vocab_size, num_seqs)
+
+        penalty_mod.get_token_bin_counts_and_mask_triton = probed_entry
+
+        orig_apply = sampler_mod.AscendSampler.apply_penalties
+
+        def probed_apply(logits, sampling_metadata, output_token_ids):
+            # 2026-10-20 MTE 复现实验:penalty 张量在 device 上,.tolist()
+            # 同样是 D2H 同步点,一并去掉——penalty 原始值由边侧 wire
+            # penalties 探针(CPU 侧)记录,云侧只留宿主侧元数据。
+            # 排查续②:惩罚的真实输入是 output_token_ids(async 下已经
+            # update_async_output_token_ids 修复占位),不是 token_ids_cpu
+            # 账本(账本含 -1 是 async 设计常态)。此处清点修复后输入里
+            # 的 -1 行——这才是"毒是否到达内核"的真判据;纯 Python 列表
+            # 扫描,零设备同步。
+            if not sampling_metadata.no_penalties and budget["left"] > 0:
+                budget["left"] -= 1
+                prompt_ids = sampling_metadata.prompt_token_ids
+                poison_rows = sum(1 for row in output_token_ids if -1 in row)
+                if poison_rows:
+                    lwd_logger.warning(
+                        "[LWD][sampler-probe] PENALTY INPUT POISON "
+                        "rows=%d/%d",
+                        poison_rows, len(output_token_ids),
+                    )
+                lwd_logger.info(
+                    "[LWD][sampler-probe] penalties ACTIVE logits=%s "
+                    "prompt_ids=%s poison_rows=%d",
+                    tuple(logits.shape),
+                    ("None" if prompt_ids is None
+                     else tuple(prompt_ids.shape)),
+                    poison_rows,
+                )
+            return orig_apply(logits, sampling_metadata, output_token_ids)
+
+        sampler_mod.AscendSampler.apply_penalties = staticmethod(probed_apply)
+        lwd_logger.info(
+            "[LWD][sampler-probe] installed on worker (budget=%d)",
+            cls._LWD_SAMPLER_PROBE_BUDGET,
+        )
+
     def init_device(self) -> None:
         super().init_device()
         # channel-global DOWN seqno counter (worker layer, send-time alloc)
@@ -80,21 +154,28 @@ class LwdCloudWorker(LwdWorkerBase):
             self.vllm_config, self.device, worker=self
         )
         self._init_lwd_data_plane()
+        self._lwd_install_sampler_probe()
         # Only the endpoint rank (the cloud leader — first rank of the
         # first cloud DP in the topology) has a cross-node channel: start
-        # its early-recv comm thread. The hint MQ was created by the
-        # executor before worker construction and exported via env; this
-        # side creates the done MQ writer, its handle rides the READY
-        # handshake back to the engine. Other ranks register non-endpoint.
+        # its early-recv comm thread. The topology ranks are GLOBAL, while
+        # self.rank is the executor's per-node numbering — the edge card
+        # count offsets them (seen live: local rank 1 of the cloud was
+        # picked as "endpoint", its comm thread then died on "rank 2 holds
+        # no lwd_up channel"). Compare the distributed global rank.
+        import torch.distributed as dist
+
+        global_rank = dist.get_rank()
         self._lwd_early_recv_endpoint = (
-            self.rank
+            global_rank
             == self.vllm_config.lwd_config.topology.clouds[0].dp[0].ranks[0]
         )
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         # One log line per cloud rank: which ranks own the comm thread is obvious at a glance.
         lwd_logger.info(
-            "[Lwd][pre-recv] worker rank=%d endpoint=%s hidden=%d",
-            self.rank, self._lwd_early_recv_endpoint, self._lwd_up_hidden_size,
+            "[Lwd][pre-recv] worker local_rank=%d global_rank=%d endpoint=%s "
+            "hidden=%d",
+            self.rank, global_rank, self._lwd_early_recv_endpoint,
+            self._lwd_up_hidden_size,
         )
         if self._lwd_early_recv_endpoint:
             self._start_lwd_early_recv_thread()
@@ -338,14 +419,24 @@ class LwdCloudWorker(LwdWorkerBase):
         both lines but no SUBMIT = no hints arrived (hint MQ not attached;
         the log will say attached/none).
         """
+        from vllm.distributed.lwd import get_lwd_init_method
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
             attach_hint_mq,
             create_report_mq,
+            publish_done_mq_handle,
         )
 
         self._irecv_hint_mq = attach_hint_mq()
         self._irecv_done_mq = create_report_mq()
         self.irecv_done_mq = self._irecv_done_mq
+        # The handle travels to the engine through the wire TCP store, so
+        # the vllm executor stays free of LWD plumbing. The URL must come
+        # from the topology (self.distributed_init_method is the
+        # executor's file store, not the wire store).
+        publish_done_mq_handle(
+            self._irecv_done_mq,
+            get_lwd_init_method(self.vllm_config.lwd_config),
+        )
         lwd_logger.info(
             "[Lwd][pre-recv] comm thread starting rank=%d hint MQ=%s",
             self.rank, "attached" if self._irecv_hint_mq is not None else "none",
