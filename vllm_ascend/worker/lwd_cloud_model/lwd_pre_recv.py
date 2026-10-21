@@ -20,10 +20,16 @@ is consumed single-threaded by ``worker_busy_loop``, which blocks for
 hundreds of milliseconds inside ``execute_model`` for a prefill batch — a
 hint queued there would never get its recv posted "early".
 
-* hint MQ: the engine creates the writer (handle exported to env before
-  worker creation); the cloud endpoint rank attaches the reader by handle;
-* done MQ: the cloud endpoint rank creates the writer, the handle rides
-  the READY handshake back, and the engine attaches the reader.
+* hint MQ: the cloud engine creates the writer before it builds the
+  executor and exports the handle to the env; the cloud endpoint rank
+  attaches the reader by handle;
+* done MQ: the cloud endpoint rank creates the writer; after the executor
+  is up, the engine fetches its handle with ``collective_rpc``
+  (``LwdCloudWorker.lwd_early_recv_done_handle``) and attaches the reader.
+
+Both run only when ``feature_ctrl.enable_early_recv`` is on in the
+topology; with it off the endpoint posts each UP recv at dispatch and the
+cloud scheduler has no gate.
 
 Watermark semantics: ``is_irecv_complete(channel, seqno)`` ==
 ``seqno <= watermark``. Per-channel completion order = seqno order
@@ -74,9 +80,10 @@ if TYPE_CHECKING:
 # lwd_cloud_engine.py / lwd_cloud_mixed_scheduler.py /
 # lwd_cloud_worker.py).
 
-#: Env var carrying the downstream hint MQ handle. The executor exports it
-#: before creating the worker; the worker rebuilds the reader in
-#: ``init_device`` — both sides honor this single constant name.
+#: Env var carrying the downstream hint MQ handle. The cloud engine exports
+#: it before building the executor, so the workers inherit it; the worker
+#: rebuilds the reader in ``init_device`` — both sides honor this single
+#: constant name.
 LWD_RECV_HINT_MQ_ENV = "VLLM_ASCEND_LWD_RECV_HINT_HANDLE"
 
 # Bypass MQ spec: 1KB per slot, 64 slots. One hint/report per batch; the
@@ -139,8 +146,9 @@ def create_hint_mq() -> "MessageQueue":
     """Engine side: create the hint MQ (writer) and export the handle to
     the environment.
 
-    Must be called before workers are created (they rebuild the reader
-    from the env at startup); both fork and spawn inherit via env vars.
+    Must be called before the executor creates the workers (they rebuild
+    the reader from the env at startup); both fork and spawn inherit via
+    env vars.
     """
     mq = _new_sideband_mq()
     os.environ[LWD_RECV_HINT_MQ_ENV] = base64.b64encode(
@@ -151,12 +159,7 @@ def create_hint_mq() -> "MessageQueue":
 
 def attach_hint_mq() -> "MessageQueue | None":
     """Worker side: rebuild the hint MQ reader from the handle in the
-    environment.
-
-    Returns None when no handle exists (this role takes no hints): the
-    comm thread still runs reporting, so a missing hint only delays the
-    early recv, never stalls the watermark.
-    """
+    environment; None when no handle exists."""
     raw = os.environ.get(LWD_RECV_HINT_MQ_ENV)
     if raw is None:
         return None
@@ -166,7 +169,7 @@ def attach_hint_mq() -> "MessageQueue | None":
 
 
 def create_report_mq() -> "MessageQueue":
-    """Worker side: create the done MQ (writer); the handle returns to the engine with the READY handshake."""
+    """Worker side: create the done MQ (writer); the engine fetches its handle over ``collective_rpc``."""
     return _new_sideband_mq()
 
 
@@ -199,15 +202,13 @@ def post_irecv_hint(hint: dict) -> None:
     and they must be visible in the logs.
     """
     if _hint_sender is None:
-        # No transport = this process does not participate in early recv
-        # (e.g. the phase-scheduler escape hatch): losing a hint costs no
-        # correctness — that branch has no gate waiting on it, and the
-        # consume point posts the recv itself.
-        lwd_logger.warning(
-            "[Lwd][pre-recv] HINT DROPPED: no sender registered seqno=%s",
-            hint.get("seqno"),
+        # The engine registers the sender before it accepts any edge
+        # message whenever early receive is on, so a missing one is a
+        # wiring error; dropping the hint would stall the gate forever.
+        raise RuntimeError(
+            f"[LWD] early-recv hint for seqno {hint.get('seqno')} has no "
+            "registered sender"
         )
-        return
     _hint_sender(hint)
 
 

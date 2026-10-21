@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import torch
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.core.sched.output import LwdBatchType
 from vllm.v1.lwd_control.lwd_control_diag import LwdControlDiag
@@ -41,7 +42,7 @@ class LwdEdgeWorker(LwdWorkerBase):
         lwd_logger.info(
             "[lwd-edge] worker ready: duplex channels (UP/DOWN) initialized "
             "on global rank=%d",
-            self.rank,
+            torch.distributed.get_rank(),
         )
 
     def compile_or_warm_up_model(self) -> "CompilationTimes":
