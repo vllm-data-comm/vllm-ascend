@@ -86,15 +86,18 @@ class LwdCloudWorker(LwdWorkerBase):
         # executor before worker construction and exported via env; this
         # side creates the done MQ writer, its handle rides the READY
         # handshake back to the engine. Other ranks register non-endpoint.
+        # self.rank is the rank within this instance; the topology numbers
+        # ranks in the shared world.
+        global_rank = torch.distributed.get_rank()
         self._lwd_early_recv_endpoint = (
-            self.rank
+            global_rank
             == self.vllm_config.lwd_config.topology.clouds[0].dp[0].ranks[0]
         )
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         # One log line per cloud rank: which ranks own the comm thread is obvious at a glance.
         lwd_logger.info(
-            "[Lwd][pre-recv] worker rank=%d endpoint=%s hidden=%d",
-            self.rank, self._lwd_early_recv_endpoint, self._lwd_up_hidden_size,
+            "[Lwd][pre-recv] worker global rank=%d endpoint=%s hidden=%d",
+            global_rank, self._lwd_early_recv_endpoint, self._lwd_up_hidden_size,
         )
         if self._lwd_early_recv_endpoint:
             self._start_lwd_early_recv_thread()
