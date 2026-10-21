@@ -658,7 +658,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             # frombuffer + direct CPU write into req_state (control-plane
             # delivery, no device round-trip); delta = last-chunk max()
             # self-derivation, accumulated per request
-            lwd_logger.info(
+            lwd_logger.debug(
                 "[Lwd][perf] cloud mrope-inject seqno=%s rows=%d "
                 "cpu=%.2f delta=%.2fms",
                 batch_seqno, mrope_rows,
@@ -714,7 +714,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 async_op=True,
             )
             work.wait()  # Bridge broadcast completion onto the current (compute) stream so later copies are ordered
-        lwd_logger.info(
+        lwd_logger.debug(
             "[Lwd][perf] cloud up-recv-wait seqno=%s dur=%.2fms",
             staged.seqno, (time.monotonic() - staged.t_wait) * 1000,
         )
@@ -978,7 +978,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         )
         # [Lwd][perf] Collection segments: rank = rank computation + row
         # gathering; pinned = meta packaging + copy
-        lwd_logger.info(
+        lwd_logger.debug(
             "[Lwd][perf] collect rows=%d rank=%.2f pinned=%.2f total=%.2fms",
             hidden_packet.shape[0],
             (selection_done - _t0) * 1000,
