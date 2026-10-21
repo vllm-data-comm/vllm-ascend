@@ -18,13 +18,12 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
-from vllm.distributed.parallel_state import get_pp_group, get_tp_group
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.forward_context import get_forward_context
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
-from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
     hash_layer_count,
@@ -117,16 +116,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
             self._lwd_hash_prompt_mask = torch.zeros(self.max_num_tokens, dtype=torch.bool, device=device)
             self._lwd_hash_token_ids = torch.zeros(self.max_num_tokens, dtype=torch.int64, device=device)
-
-    def _get_drafter(self) -> "SpecDecodeBaseProposer | None":
-        """Use the LWD MTP embedding adapter only in LWD mode."""
-        if (
-            self.vllm_config.lwd_config is not None
-            and self.speculative_config.method == "mtp"
-            and not self.speculative_config.use_step3p5_mtp()
-        ):
-            return LwdMTPProposer(self.vllm_config, self.device, self)
-        return super()._get_drafter()
 
     # ------------------------------------------------------------------ #
     # Remote embeds injection (cloud input has NO token ids — the prompt   #
@@ -423,19 +412,16 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                        intermediate_tensors: "IntermediateTensors | None" = None,
                        inputs_embeds: "torch.Tensor | None" = None,
                        **model_kwargs) -> "torch.Tensor":
-        """Shard embeddings per the SP layout and publish the full Hash routing data into the forward context."""
+        """Publish the full Hash routing data into the forward context.
+
+        The injected embeddings keep the full-token layout, as the native
+        embedding layer's all-reduced output does.
+        """
+        # TODO(lwd): the injected embeddings bypass the embedding layer. Once
+        # vLLM's MoE sequence parallelism (use_sequence_parallel_moe, which
+        # needs DP > 1) is reachable for LWD, verify that it splits them in
+        # the MoE layer like the native embeddings; LWD rejects DP > 1 today.
         context = get_forward_context()
-        if (inputs_embeds is not None and intermediate_tensors is None
-                and context.flash_comm_v1_enabled and not self.supports_mm_inputs):
-            # Passing embeddings directly bypasses the native embedding layer; re-apply the sequence split here.
-            tp_group = get_tp_group()
-            if tp_group.world_size > 1:
-                if inputs_embeds.shape[0] != num_tokens_padded:
-                    raise ValueError("LWD SP expects full-token inputs_embeds before slicing")
-                if context.pad_size:
-                    inputs_embeds = torch.nn.functional.pad(inputs_embeds, (0, 0, 0, context.pad_size))
-                inputs_embeds = inputs_embeds.chunk(tp_group.world_size, dim=0)[tp_group.rank_in_group]
-            # Positions, attention metadata and the Hash routing tables keep the full-token layout.
         if self.lwd_hash_state is not None:
             # Initialize the routing index cache first so padded rows use the legal zero index.
             self._lwd_hash_token_ids.zero_()
