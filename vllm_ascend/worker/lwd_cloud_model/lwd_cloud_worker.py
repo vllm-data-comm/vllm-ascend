@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import threading
 import time
+from typing import TYPE_CHECKING
 
 import torch
 from vllm.lwd_logger import lwd_logger
@@ -33,6 +34,9 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
 )
 from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, hash_payload_numel
+
+if TYPE_CHECKING:
+    from vllm.distributed.device_communicators.shm_broadcast import Handle
 
 
 # Early-recv thread loop tuning: MQ dequeue timeout, backoff sleep after a
@@ -81,11 +85,9 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         self._init_lwd_data_plane()
         # Only the endpoint rank (the cloud leader — first rank of the
-        # first cloud DP in the topology) has a cross-node channel: start
-        # its early-recv comm thread. The hint MQ was created by the
-        # executor before worker construction and exported via env; this
-        # side creates the done MQ writer, its handle rides the READY
-        # handshake back to the engine. Other ranks register non-endpoint.
+        # first cloud DP in the topology) has a cross-node channel and
+        # posts the UP recvs; the other ranks get the data through the TP
+        # broadcast at inject time.
         # self.rank is the rank within this instance; the topology numbers
         # ranks in the shared world.
         global_rank = torch.distributed.get_rank()
@@ -93,15 +95,31 @@ class LwdCloudWorker(LwdWorkerBase):
             global_rank
             == self.vllm_config.lwd_config.topology.clouds[0].dp[0].ranks[0]
         )
+        self._lwd_early_recv_enabled = (
+            self.vllm_config.lwd_config.topology.feature_ctrl.enable_early_recv
+        )
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         # One log line per cloud rank: which ranks own the comm thread is obvious at a glance.
         lwd_logger.info(
-            "[Lwd][pre-recv] worker global rank=%d endpoint=%s hidden=%d",
-            global_rank, self._lwd_early_recv_endpoint, self._lwd_up_hidden_size,
+            "[Lwd][pre-recv] worker global rank=%d endpoint=%s early_recv=%s hidden=%d",
+            global_rank, self._lwd_early_recv_endpoint,
+            self._lwd_early_recv_enabled, self._lwd_up_hidden_size,
         )
-        if self._lwd_early_recv_endpoint:
+        # With early receive on, the endpoint's comm thread pre-posts the
+        # UP recvs on the engine's hints (the hint MQ handle comes from the
+        # env, exported by the engine before the executor was built). With
+        # it off, the endpoint posts each recv when its batch is dispatched.
+        if self._lwd_early_recv_endpoint and self._lwd_early_recv_enabled:
             self._start_lwd_early_recv_thread()
         self._register_lwd_prompt_embeds_provider()
+
+    def lwd_early_recv_done_handle(self) -> "Handle | None":
+        """Handle of the early-recv done MQ, for the engine to attach its
+        reader; None on ranks that do not report (non-endpoint, or early
+        receive off)."""
+        if self._irecv_done_mq is None:
+            return None
+        return self._irecv_done_mq.export_handle()
 
     def load_model(self) -> None:
         """Log the real layer split after loading: layer count / first-last
@@ -216,9 +234,14 @@ class LwdCloudWorker(LwdWorkerBase):
         # pre-posted aux irecv forever unmatched and stall the watermark.
         # The aux frame mechanism stays in the channel layer for deepstack
         # and other future payloads.
-        if self._lwd_early_recv_endpoint:
+        if self._lwd_early_recv_endpoint and self._lwd_early_recv_enabled:
             future = self.get_or_post_early_recv(
                 batch.seqno, num_tokens, 0
+            )
+        elif self._lwd_early_recv_endpoint:
+            # Early receive off: post at dispatch; the forward waits on it.
+            future = lwd_get_data_plane().submit_recv(
+                self._lwd_build_up_recv_request(batch.seqno, num_tokens, 0)
             )
         else:
             # Non-endpoint: never touches the cross-node channel; the
@@ -293,13 +316,11 @@ class LwdCloudWorker(LwdWorkerBase):
         ] = {}
         # Rate-limit timestamp for the stuck-queue diagnostic
         self._early_recv_stuck_log_at = 0.0
-        # Downstream hint MQ (reader) / upstream completion MQ (writer)
+        # Downstream hint MQ (reader) / upstream completion MQ (writer); the
+        # engine attaches the done MQ reader through
+        # lwd_early_recv_done_handle.
         self._irecv_hint_mq = None
         self._irecv_done_mq = None
-        # Public alias: WorkerProc takes it after worker construction,
-        # returns the handle with READY, and the engine attaches its done
-        # reader (see vllm/v1/executor/multiproc_executor.py).
-        self.irecv_done_mq = None
         self._lwd_early_recv_thread: threading.Thread | None = None
 
     def _lwd_build_up_recv_request(
@@ -342,13 +363,21 @@ class LwdCloudWorker(LwdWorkerBase):
         the log will say attached/none).
         """
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import (
+            LWD_RECV_HINT_MQ_ENV,
             attach_hint_mq,
             create_report_mq,
         )
 
         self._irecv_hint_mq = attach_hint_mq()
+        if self._irecv_hint_mq is None:
+            # The engine exports the handle before building the executor
+            # whenever early receive is on; a missing one would leave the
+            # gate waiting forever.
+            raise RuntimeError(
+                "[LWD] early receive is on but the hint MQ handle "
+                f"({LWD_RECV_HINT_MQ_ENV}) is missing from the environment"
+            )
         self._irecv_done_mq = create_report_mq()
-        self.irecv_done_mq = self._irecv_done_mq
         lwd_logger.info(
             "[Lwd][pre-recv] comm thread starting rank=%d hint MQ=%s",
             self.rank, "attached" if self._irecv_hint_mq is not None else "none",
