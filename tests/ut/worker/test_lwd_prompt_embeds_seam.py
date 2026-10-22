@@ -149,3 +149,57 @@ def test_runtime_supports_mm_inputs_property() -> None:
     assert runner.supports_mm_inputs is False  # injected batch: gate closed
     runner.input_batch = NS(req_prompt_embeds={})
     assert runner.supports_mm_inputs is True   # empty batch: model true value
+
+
+def _stub_prompt_embeds_runner(cls, lwd_hash_state, count: int):
+    """Bind only the attributes _lwd_preprocess_prompt_embeds touches."""
+    import torch
+
+    runner = cls.__new__(cls)
+    runner.lwd_hash_state = lwd_hash_state
+    runner.is_token_ids = NS(gpu=torch.tensor([False] * (count - 2) + [True, True]))
+    runner.input_ids = NS(gpu=torch.full((16,), 7, dtype=torch.long))
+    runner.inputs_embeds = NS(gpu=torch.zeros(16, 8))
+    runner.model = NS(embed_input_ids=lambda input_ids: torch.zeros(input_ids.shape[0], 8))
+    runner.uses_mrope = False
+    runner.uses_xdrope_dim = 0
+    runner.positions = torch.arange(16, dtype=torch.float32)
+    runner._init_model_kwargs = lambda: {}
+    return runner
+
+
+def test_prompt_embeds_model_ids_none_for_non_dsv4() -> None:
+    """Non-DSV4 models (lwd_hash_state is None, e.g. Qwen) must keep the
+    native None model input_ids: the DSV4 hash placeholder seam changes
+    nothing for them (regression lock for the model-scope guarantee)."""
+    cls = _cloud_cls()
+    count, num_input_tokens = 4, 8
+    runner = _stub_prompt_embeds_runner(cls, None, count)
+
+    ret = runner._lwd_preprocess_prompt_embeds(
+        NS(total_num_scheduled_tokens=count), num_input_tokens
+    )
+
+    assert ret[0] is None
+
+
+def test_prompt_embeds_model_ids_placeholder_for_dsv4() -> None:
+    """DSV4 cloud prompt steps must hand the model a non-None,
+    information-free ids tensor: upstream's hash MoE fail-fast rejects
+    None, and real token IDs must stay off the cloud, so the placeholder
+    is all zeros by construction and never carries buffer values. The
+    shared input_ids buffer must not be mutated."""
+    cls = _cloud_cls()
+    import torch
+
+    count, num_input_tokens = 4, 8
+    runner = _stub_prompt_embeds_runner(cls, object(), count)
+
+    ret = runner._lwd_preprocess_prompt_embeds(
+        NS(total_num_scheduled_tokens=count), num_input_tokens
+    )
+
+    assert ret[0] is not None
+    assert ret[0].shape == (num_input_tokens,)
+    assert torch.count_nonzero(ret[0]) == 0  # information-free placeholder
+    assert torch.all(runner.input_ids.gpu == 7)  # shared buffer untouched
