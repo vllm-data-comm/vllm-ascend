@@ -203,3 +203,19 @@ def test_prompt_embeds_model_ids_placeholder_for_dsv4() -> None:
     assert ret[0].shape == (num_input_tokens,)
     assert torch.count_nonzero(ret[0]) == 0  # information-free placeholder
     assert torch.all(runner.input_ids.gpu == 7)  # shared buffer untouched
+
+
+def test_model_forward_covers_dummy_run_ids() -> None:
+    """The dummy/profile run also takes the inputs_embeds branch
+    (input_ids=None) when enable_prompt_embeds is on, so _model_forward
+    must hand the model a non-None all-zeros placeholder inside the
+    lwd_hash_state block -- otherwise the startup memory profile dies at
+    the model-layer hash fail-fast before any request is ever served."""
+    src = CLOUD.read_text(encoding="utf-8")
+    start = src.index("def _model_forward(")
+    end = src.find("\n    def ", start + 1)
+    block = src[start:] if end < 0 else src[start:end]
+    assert "if input_ids is None:" in block
+    assert "torch.zeros_like(self.input_ids.gpu[:num_tokens_padded])" in block
+    # The placeholder must be built before the super() call consumes it.
+    assert block.index("torch.zeros_like") < block.index("super()._model_forward(")
