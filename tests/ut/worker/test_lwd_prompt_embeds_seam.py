@@ -219,3 +219,18 @@ def test_model_forward_covers_dummy_run_ids() -> None:
     assert "torch.zeros_like(self.input_ids.gpu[:num_tokens_padded])" in block
     # The placeholder must be built before the super() call consumes it.
     assert block.index("torch.zeros_like") < block.index("super()._model_forward(")
+
+
+def test_prompt_embeds_positions_follow_base_two_way_split() -> None:
+    """The prompt-embeds position branch must mirror this base's two-way
+    split (mrope/plain). The retired v0.23 base exposed uses_xdrope_dim;
+    referencing it here crashed the first DSV4 request (no mrope -> elif
+    evaluated -> AttributeError) while mrope models (Qwen) never reached
+    it -- a latent port break, so lock the retired attribute out."""
+    src = CLOUD.read_text(encoding="utf-8")
+    assert "uses_xdrope_dim" not in src
+    start = src.index("def _lwd_preprocess_prompt_embeds(")
+    end = src.find("\n    def ", start + 1)
+    block = src[start:] if end < 0 else src[start:end]
+    assert "if self.uses_mrope:" in block
+    assert "self.positions[:num_input_tokens]" in block
