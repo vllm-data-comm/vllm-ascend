@@ -86,6 +86,7 @@ from vllm_ascend.models.common.ops.sequence_parallel import (
 )
 from vllm_ascend.models.deepseek_v4.compressor import Compressor
 from vllm_ascend.models.deepseek_v4.indexer import DeepseekV4Indexer
+from vllm_ascend.models.deepseek_v4.layer_weights import is_layer_weight_out_of_range
 from vllm_ascend.ops.dsa import AscendDeepseekSparseAttention, DSAModules
 from vllm_ascend.ops.rope_dsv4 import ComplexExpRotaryEmbedding
 from vllm_ascend.ops.triton.mul_add import muls_add_triton
@@ -1181,6 +1182,12 @@ class AscendDeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV2MixtureOfExpe
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
             if spec_layer is not None:
                 continue  # skip spec decode layers for main model
+
+            # Decoder-layer weights this process does not hold (the LWD edge
+            # builds zero layers; a PP rank holds a slice) are skipped up
+            # front so no per-name lookup below can raise on them.
+            if is_layer_weight_out_of_range(name, self.model.start_layer, self.model.end_layer):
+                continue
 
             # TODO:
             if not name.startswith("model"):
