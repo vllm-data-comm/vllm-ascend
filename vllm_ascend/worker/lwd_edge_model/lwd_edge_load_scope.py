@@ -14,27 +14,47 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-"""Embed-only model loading scope for the LWD edge.
+"""Embed-only model loading toolkit for the LWD edge (stdlib only).
 
 The LWD edge runs embedding + lm_head only (no decoder layers, no KV
-cache). The standard model loader decides how many decoder layers to
-build from the hf config's ``num_hidden_layers``, so the edge load is
-wrapped in a scope that temporarily zeroes it: the loader then builds
-zero decoder layers natively and upstream files stay untouched (zero
-invasion). The true depth is restored on exit, including on exceptions,
-so every consumer after the load -- Hash routing table validation,
-logging -- sees the real value, matching the mm branch's "config keeps
-N, model has zero layers" edge semantics.
+cache). Two pure helpers cover the whole load-side story:
 
-This module is deliberately dependency-free (stdlib only) so the load
-logic stays testable on any interpreter.
+- :func:`edge_embed_only_load`: the standard model loader decides how
+  many decoder layers to build from the hf config's
+  ``num_hidden_layers``; the edge load is wrapped in a scope that
+  temporarily zeroes it, so the loader builds zero decoder layers
+  natively while upstream files stay untouched. The true depth is
+  restored on exit, including on exceptions, so every consumer after
+  the load -- Hash routing table validation, logging -- sees the real
+  value, matching the mm branch's "config keeps N, model has zero
+  layers" edge semantics.
+
+- :func:`is_layer_weight_out_of_range`: the checkpoint always ships
+  every layer, so the loader filters weights of decoder layers this
+  process does not hold by layer index (``start_layer <= idx <
+  end_layer``); non-layer weights (embeddings, norms, heads) are never
+  filtered.
+
+Stdlib-only by design so the load logic stays testable on any
+interpreter.
 """
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
+
+_LAYER_INDEX_RE = re.compile(r"\blayers\.(\d+)\.")
+
+
+def is_layer_weight_out_of_range(name: str, start_layer: int, end_layer: int) -> bool:
+    """True when the weight belongs to a decoder layer this process does not hold."""
+    match = _LAYER_INDEX_RE.search(name)
+    if match is None:
+        return False
+    return not (start_layer <= int(match.group(1)) < end_layer)
 
 
 @contextmanager

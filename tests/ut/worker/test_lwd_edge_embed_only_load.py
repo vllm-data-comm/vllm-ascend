@@ -34,6 +34,8 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _RUNNER = _REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py"
 _SCOPE = _REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_load_scope.py"
+_LOADER = _REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_loader.py"
+_DSV4_MODEL = _REPO_ROOT / "vllm_ascend/models/deepseek_v4/model.py"
 
 
 def _load_scope_module() -> "object":
@@ -47,7 +49,9 @@ def _load_scope_module() -> "object":
     return module
 
 
-edge_embed_only_load = _load_scope_module().edge_embed_only_load
+_scope_module = _load_scope_module()
+edge_embed_only_load = _scope_module.edge_embed_only_load
+is_layer_weight_out_of_range = _scope_module.is_layer_weight_out_of_range
 
 
 def test_scope_zeroes_and_restores_plain_config() -> None:
@@ -95,13 +99,13 @@ def test_scope_restores_on_exception() -> None:
     assert config.num_hidden_layers == 61
 
 
-def test_runner_load_wrapped_in_embed_only_scope() -> None:
-    """The standard load call must stay inside the embed-only scope; the
-    scope import must stay present (red on the pre-fix runner)."""
+def test_runner_routes_load_through_edge_loader_format() -> None:
+    """The standard load call must stay wrapped in the loader-format swap
+    that dispatches to the registered embed-only loader (red on the
+    pre-fix runner)."""
     src = _RUNNER.read_text(encoding="utf-8")
-    assert "from vllm_ascend.worker.lwd_edge_model.lwd_edge_load_scope import edge_embed_only_load" in src
-    assert "with edge_embed_only_load(self.model_config.hf_config):" in src
-    wrapped = "with edge_embed_only_load(self.model_config.hf_config):\n            super().load_model()"
+    assert "from vllm_ascend.worker.lwd_edge_model.lwd_edge_loader import lwd_edge_loader_format" in src
+    wrapped = "with lwd_edge_loader_format(self.vllm_config.load_config):\n            super().load_model()"
     assert wrapped in src
 
 
@@ -112,3 +116,57 @@ def test_scope_module_keeps_finally_restore() -> None:
     assert "finally:" in src
     assert "text_config.num_hidden_layers = real_layers" in src
     assert "get_text_config" in src
+
+
+def test_layer_weights_filtered_by_range() -> None:
+    """Layer weights are in range only for [start_layer, end_layer): the
+    LWD edge (0, 0) filters every layer; the cloud (0, N) filters none;
+    a PP slice keeps its own bounds."""
+    edge = lambda name: is_layer_weight_out_of_range(name, 0, 0)
+    cloud = lambda name: is_layer_weight_out_of_range(name, 0, 61)
+    assert edge("model.layers.0.self_attn.attn_sink")
+    assert edge("model.layers.60.mlp.experts.5.gate_proj.weight")
+    assert not cloud("model.layers.0.self_attn.attn_sink")
+    assert not cloud("model.layers.60.mlp.experts.5.gate_proj.weight")
+
+    pp_rank = lambda name: is_layer_weight_out_of_range(name, 1, 2)
+    assert pp_rank("model.layers.0.self_attn.attn_sink")
+    assert not pp_rank("model.layers.1.self_attn.attn_sink")
+    assert pp_rank("model.layers.2.self_attn.attn_sink")
+
+
+def test_non_layer_weights_never_filtered() -> None:
+    """Weights without a decoder-layer index must always load: the edge
+    keeps embed_tokens / norm / lm_head."""
+    for name in (
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+        "model.head.weight",
+    ):
+        assert not is_layer_weight_out_of_range(name, 0, 0)
+        assert not is_layer_weight_out_of_range(name, 0, 61)
+
+
+def test_edge_loader_registered_and_filters_stream() -> None:
+    """The embed-only loader must be a registered DefaultModelLoader
+    subclass whose get_all_weights drops out-of-range layer weights --
+    the mechanism that keeps foreign layer weights away from the shared
+    load_weights (no placeholder names to key on)."""
+    src = _LOADER.read_text(encoding="utf-8")
+    assert '@register_model_loader(LWD_EDGE_LOAD_FORMAT)' in src
+    assert "class LwdEdgeEmbedOnlyLoader(DefaultModelLoader):" in src
+    assert "def get_all_weights(" in src
+    assert "is_layer_weight_out_of_range(name, start_layer, end_layer)" in src
+    assert "with edge_embed_only_load(model_config.hf_config):" in src
+    # The format swap must restore the stock format on exit.
+    assert "load_config.load_format = original" in src
+
+
+def test_shared_model_files_stay_lwd_free() -> None:
+    """Constraint lock: the embed-only load must live entirely in LWD-owned
+    code; the shared DeepSeek V4 model file must not carry the filter
+    (red while c5b2ff1e7-style model-side guards are present)."""
+    src = _DSV4_MODEL.read_text(encoding="utf-8")
+    assert "is_layer_weight_out_of_range" not in src
+    assert "layer_weights" not in src
