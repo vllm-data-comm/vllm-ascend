@@ -149,18 +149,22 @@ def test_non_layer_weights_never_filtered() -> None:
 
 
 def test_edge_loader_registered_and_filters_stream() -> None:
-    """The embed-only loader must be a registered DefaultModelLoader
-    subclass whose get_all_weights drops out-of-range layer weights --
-    the mechanism that keeps foreign layer weights away from the shared
-    load_weights (no placeholder names to key on)."""
+    """The embed-only loader must be a DefaultModelLoader subclass whose
+    get_all_weights drops out-of-range layer weights -- the mechanism
+    that keeps foreign layer weights away from the shared load_weights
+    (no placeholder names to key on). Dispatch swaps the registry entry
+    for the deployment's own format; the load_format string must never
+    be rewritten (DefaultModelLoader._prepare_weights validates it)."""
     src = _LOADER.read_text(encoding="utf-8")
-    assert '@register_model_loader(LWD_EDGE_LOAD_FORMAT)' in src
     assert "class LwdEdgeEmbedOnlyLoader(DefaultModelLoader):" in src
     assert "def get_all_weights(" in src
     assert "is_layer_weight_out_of_range(name, start_layer, end_layer)" in src
     assert "with edge_embed_only_load(model_config.hf_config):" in src
-    # The format swap must restore the stock format on exit.
-    assert "load_config.load_format = original" in src
+    # Registry swap in and out; the format string itself stays untouched.
+    assert "original_cls = type(get_model_loader(load_config))" in src
+    assert "register_model_loader(source_format)(LwdEdgeEmbedOnlyLoader)" in src
+    assert "register_model_loader(source_format)(original_cls)" in src
+    assert "load_config.load_format =" not in src
 
 
 def test_shared_model_files_stay_lwd_free() -> None:

@@ -14,7 +14,7 @@
 # limitations under the License.
 # This file is a part of the vllm-ascend project.
 #
-"""Embed-only model loader for the LWD edge (registered load format).
+"""Embed-only model loader for the LWD edge (registry-swapped loader).
 
 The edge process builds embed + lm_head only: the loader zeroes the
 text config's layer count for the construction (see lwd_edge_load_scope)
@@ -24,10 +24,13 @@ LWD-specific guards (the hand-rolled load_weights of e.g. DeepSeek V4
 recognizes foreign layers via PPMissingLayer placeholder names, which an
 empty layer list cannot provide).
 
-Dispatch goes through vLLM's own loader registry: the edge runner swaps
-``load_config.load_format`` for the duration of the load
-(:func:`lwd_edge_loader_format`); the cloud and every non-LWD process
-keep the stock ``DefaultModelLoader`` untouched.
+Dispatch goes through vLLM's own loader registry: for the duration of
+the load the registry entry for the deployment's own load format is
+swapped to this loader (:func:`lwd_edge_loader_format`). The
+``load_config.load_format`` string itself is never changed --
+``DefaultModelLoader._prepare_weights`` validates it against vLLM's
+known formats -- and the cloud and every non-LWD process keep the stock
+``DefaultModelLoader`` untouched.
 """
 
 from __future__ import annotations
@@ -38,7 +41,10 @@ from contextlib import contextmanager
 import torch
 from torch import nn
 from vllm.config import LoadConfig, ModelConfig, VllmConfig
-from vllm.model_executor.model_loader import register_model_loader
+from vllm.model_executor.model_loader import (
+    get_model_loader,
+    register_model_loader,
+)
 from vllm.model_executor.model_loader.default_loader import DefaultModelLoader
 
 from vllm_ascend.worker.lwd_edge_model.lwd_edge_load_scope import (
@@ -46,10 +52,7 @@ from vllm_ascend.worker.lwd_edge_model.lwd_edge_load_scope import (
     is_layer_weight_out_of_range,
 )
 
-LWD_EDGE_LOAD_FORMAT = "lwd_edge_embed_only"
 
-
-@register_model_loader(LWD_EDGE_LOAD_FORMAT)
 class LwdEdgeEmbedOnlyLoader(DefaultModelLoader):
     """DefaultModelLoader with zero decoder layers and foreign layer
     weights filtered from the stream; see the module docstring."""
@@ -78,11 +81,17 @@ class LwdEdgeEmbedOnlyLoader(DefaultModelLoader):
 
 @contextmanager
 def lwd_edge_loader_format(load_config: LoadConfig) -> Iterator[None]:
-    """Route the standard load through the embed-only loader for the
-    duration of the context (edge process only)."""
-    original = load_config.load_format
-    load_config.load_format = LWD_EDGE_LOAD_FORMAT
+    """Route the deployment's own load format to the embed-only loader
+    for the duration of the context (edge process only).
+
+    The registry entry is swapped, never ``load_config.load_format``:
+    ``DefaultModelLoader._prepare_weights`` validates that string
+    against vLLM's known formats and rejects custom names.
+    """
+    source_format = load_config.load_format
+    original_cls = type(get_model_loader(load_config))
+    register_model_loader(source_format)(LwdEdgeEmbedOnlyLoader)
     try:
         yield
     finally:
-        load_config.load_format = original
+        register_model_loader(source_format)(original_cls)
