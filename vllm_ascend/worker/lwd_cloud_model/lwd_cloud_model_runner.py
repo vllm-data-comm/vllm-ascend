@@ -273,7 +273,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             self.input_batch.req_prompt_embeds = embeds_map
         self._lwd_rebuild_is_token_ids_mask(num_scheduled_tokens)
         self._lwd_release_consumed_prompt_embeds()
-        self._lwd_inject_remote_embeds(harvested, num_scheduled_tokens)
+        if getattr(self.worker, "_lwd_stager", None) is not None:
+            self._lwd_inject_from_stager(num_scheduled_tokens)
+        else:
+            self._lwd_inject_remote_embeds(harvested, num_scheduled_tokens)
         if self.lwd_hash_state is not None:
             self._lwd_prepare_hash_batch(num_scheduled_tokens)
         return out
@@ -390,6 +393,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     # ------------------------------------------------------------------ #
 
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable[[], None] | None:
+        self._lwd_rewind_staged_reads(scheduler_output)
         """LWD: materialize meta placeholder embeds in place before they
         reach the base (zero base seams).
 
@@ -679,6 +683,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             up_flat = self._lwd_harvest_tensors_one(staged)
             if up_flat is None:
                 continue
+            self._lwd_stage_to_host(batch_seqno, meta, up_flat)
             rows = self._lwd_check_up_windows(
                 batch_seqno,
                 meta,
@@ -877,6 +882,95 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             sum(staged.meta.has_mrope),
         )
         return up_flat
+
+    def _lwd_rewind_staged_reads(self, scheduler_output) -> None:
+        """Cloud-side KV preemption recompute: the scheduler watermark
+        regressed below the staged read pointer -> roll it back (the
+        pinned host payload lives until request end, so a local re-prefill
+        re-reads earlier rows; zero edge traffic). Also retires finished
+        and aborted staging entries (batch is a transport container)."""
+        stager = getattr(self.worker, "_lwd_stager", None)
+        if stager is None:
+            return
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, new_computed in zip(cached.req_ids, cached.num_computed_tokens):
+            emb = stager.take_req(req_id)
+            if emb is None:
+                continue
+            if emb.consumed > new_computed:
+                stager.rewind_consumed(req_id, new_computed)
+        finished = getattr(scheduler_output, "finished_req_ids", None) or []
+        for req_id in finished:
+            if stager.take_req(req_id) is not None:
+                stager.release_request(req_id)
+
+    def _lwd_stage_to_host(
+        self, seqno: int, meta: LwdEmbedBatch, up_flat: torch.Tensor
+    ) -> None:
+        """A3 bridge: plan per-request host buffers, D2H the landed NPU
+        payload segment-by-segment, then publish the arrival ledger.
+
+        publish_received rows are the authoritative host-arrival signal:
+        they ride a supplementary done-MQ entry (the watermark merge is
+        idempotent for a repeat seqno; the engine hold ledger reads
+        index 2 of 3-tuples only)."""
+        worker = self.worker
+        stager = getattr(worker, "_lwd_stager", None)
+        if stager is None:
+            return
+        hidden_size = self.model_config.get_hidden_size()
+        num_hash_layers, top_k = self._lwd_hash_dims()
+        prompt_lens = list(meta.prompt_lens) or [
+            off + len(t)
+            for off, t in zip(meta.prompt_offsets, meta.token_ids)
+        ]
+        segments = stager.plan_recv_segments(
+            seqno=seqno,
+            numel=up_flat.numel(),
+            hidden_size=hidden_size,
+            req_ids=meta.req_ids,
+            num_tokens_per_req=[len(t) for t in meta.token_ids],
+            prompt_lens=prompt_lens,
+            row_base=list(meta.prompt_offsets),
+            num_hash_layers=num_hash_layers,
+            num_experts_per_tok=top_k,
+        )
+        for dst_view, src_off, n in segments:
+            dst_view.copy_(up_flat[src_off : src_off + n].cpu(), non_blocking=False)
+        arrivals = stager.publish_received(seqno)
+        done_mq = getattr(worker, "_irecv_done_mq", None)
+        if done_mq is not None and arrivals:
+            rows = [(rid, base + n) for rid, n, base in arrivals]
+            done_mq.enqueue(("UP", seqno, rows))
+        lwd_logger.info(
+            "[LWD][cloud-runner] staged to host seqno=%d reqs=%d rows=%s",
+            seqno, len(meta.req_ids),
+            [(rid, base + n) for rid, n, base in arrivals],
+        )
+
+    def _lwd_inject_from_stager(self, num_scheduled_tokens: np.ndarray) -> None:
+        """Per-request inject (A3): each request fetches exactly its native
+        scheduled rows [consumed, consumed+n) from its own host buffer -
+        fetch-as-much-as-scheduled, coordinate systems kept apart."""
+        worker = self.worker
+        stager = worker._lwd_stager
+        hidden_size = self.model_config.get_hidden_size()
+        gpu_embeds = self.inputs_embeds.gpu
+        flat = 0
+        for i, rid in enumerate(self.input_batch.req_ids):
+            n = int(num_scheduled_tokens[i]) if i < len(num_scheduled_tokens) else 0
+            emb = stager.take_req(rid)
+            if emb is None or n <= 0:
+                flat += n
+                continue
+            start, numel_seg, _tail = stager.segment_for(rid, n)
+            seg = emb.host[start : start + numel_seg].view(n, hidden_size)
+            gpu_embeds[flat : flat + n].copy_(
+                seg.to(device=gpu_embeds.device, non_blocking=True),
+                non_blocking=True,
+            )
+            stager.consume(rid, n)
+            flat += n
 
     def _lwd_inject_remote_embeds(
         self,

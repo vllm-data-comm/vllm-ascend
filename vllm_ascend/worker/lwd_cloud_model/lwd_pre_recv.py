@@ -83,7 +83,13 @@ _SIDEBAND_MAX_CHUNKS = 64
 # ---------------------------------------------------------------------- #
 # Hints: produced by the scheduler, consumed by the worker comm thread   #
 # ---------------------------------------------------------------------- #
-def make_recv_hint(seqno: int, num_tokens: int, aux_rows: int = 0) -> dict:
+def make_recv_hint(
+    seqno: int,
+    num_tokens: int,
+    aux_rows: int = 0,
+    req_rows: list | None = None,
+    prompt_lens: list | None = None,
+) -> dict:
     """Build one UP early-recv hint.
 
     * ``num_tokens``: the batch's flat token count (the main-frame size
@@ -94,6 +100,13 @@ def make_recv_hint(seqno: int, num_tokens: int, aux_rows: int = 0) -> dict:
     return {
         "channel": LwdChannelType.UP,
         "seqno": int(seqno),
+        # Absolute per-request arrival rows in PROMPT coordinates
+        # (offset + rows of the range item): the worker piggybacks them on
+        # the done report, the engine's hold ledger releases on them.
+        "req_rows": [(str(r), int(n)) for r, n in (req_rows or [])],
+        # Per-request prompt total length (stager pool sizing authority;
+        # the comm-thread D2H uses it to size host buffers at full length).
+        "prompt_lens": [int(n) for n in (prompt_lens or [])],
         "num_tokens": int(num_tokens),
         "aux_rows": int(aux_rows),
     }
@@ -222,7 +235,7 @@ def post_irecv_hint(hint: dict) -> None:
 
 
 def record_irecv_completions(
-    items: Iterable[tuple[LwdChannelType, int]],
+    items: Iterable[tuple],
 ) -> list[tuple[LwdChannelType, int]]:
     """Merge worker-reported completions into the per-channel watermark
     (called after the engine drains the done MQ each step).
@@ -234,7 +247,8 @@ def record_irecv_completions(
     """
     advanced: list[tuple[LwdChannelType, int]] = []
     with _lock:
-        for channel, seqno in items:
+        for item in items:
+            channel, seqno = item[0], item[1]
             if seqno > _watermarks.get(channel, -1):
                 _watermarks[channel] = seqno
                 advanced.append((channel, seqno))
