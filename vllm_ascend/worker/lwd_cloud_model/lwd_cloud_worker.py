@@ -32,7 +32,6 @@ from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
     LwdCloudModelRunner,
 )
-from vllm_ascend.worker.lwd_hash.lwd_hash_routing import hash_layer_count, hash_payload_numel
 
 if TYPE_CHECKING:
     from typing import Any
@@ -305,7 +304,8 @@ class LwdCloudWorker(LwdWorkerBase):
         and the consume-point re-post share the same shape).
 
         HCCL P2P requires both ends to match numel exactly: the main frame
-        = the hash payload formula (embeds + optional expert-ID bytes).
+        = the UP payload layout (embeds + optional expert-ID and Engram
+        bucket-index bytes), the same one the runner unpacks.
         The aux frame mechanism is kept for deepstack and other future
         payloads (mrope positions moved to the control plane in
         wire_version 2; callers always pass aux_rows=0). The size formula
@@ -314,12 +314,7 @@ class LwdCloudWorker(LwdWorkerBase):
         return LwdTransferRequest(
             channel=LwdChannelType.UP,
             op="recv",
-            num_elements=hash_payload_numel(
-                num_tokens,
-                self._lwd_up_hidden_size,
-                hash_layer_count(self.model_config.hf_config),
-                getattr(self.model_config.hf_config, "num_experts_per_tok", 0),
-            ),
+            num_elements=self.model_runner.lwd_up_layout().numel(num_tokens),
             seqno=int(seqno),
             # The aux second payload shares the main frame's seqno; always
             # 0 since mrope retired (zero aux traffic); future payloads

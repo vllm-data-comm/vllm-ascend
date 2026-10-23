@@ -36,7 +36,7 @@ it plays no role in task priority.
 Hint fields on this branch (chunked prefill + mm/hash): ``num_tokens`` =
 the batch's (this chunk batch's) flat token count, ``aux_rows`` = the sum
 of token rows of **mrope-carrying** requests in the batch — the UP main
-frame numel is computed **worker-side** from the hash payload formula
+frame numel is computed **worker-side** from the UP payload layout
 using local config (see
 ``lwd_cloud_worker._lwd_build_up_recv_request``); the hint carries only
 "facts" (token count, mrope row count), never the size formula, so the
@@ -87,7 +87,7 @@ def make_recv_hint(seqno: int, num_tokens: int, aux_rows: int = 0) -> dict:
     """Build one UP early-recv hint.
 
     * ``num_tokens``: the batch's flat token count (the main-frame size
-      is derived worker-side from the hash payload formula)
+      is derived worker-side from the UP payload layout)
     * ``aux_rows``: the batch's mrope-carrying token rows (0 = text-only
       batch, zero aux traffic)
     """
