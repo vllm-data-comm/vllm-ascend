@@ -1079,13 +1079,25 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         query_start_loc=None,
         slot_mapping=None,
         block_table=None,
+        *,
+        external_hashes: torch.Tensor | None = None,
+        external_rows: torch.Tensor | None = None,
     ):
         """Hash on device with upstream NgramHashState, then look up head shards.
 
         Calls without the device metadata (dummy runs) participate with empty
         hashes. History is the current chunk, then the runner's prompt
         lookback window, then the slot cache the hash state fills itself.
+
+        Args:
+            external_hashes: Optional int32 [>= tokens, layers, hash columns]
+                device hashes computed elsewhere (the LWD edge for prompt
+                rows). Requires ``external_rows``.
+            external_rows: Optional bool [>= tokens] device mask of the rows
+                whose native hashes are replaced by ``external_hashes``.
         """
+        if (external_hashes is None) != (external_rows is None):
+            raise ValueError("[LWD] external_hashes and external_rows must be passed together")
         config = self.config
         if not engram_enabled(config):
             return {}, torch.empty(0, dtype=torch.bool, device=positions.device)
@@ -1134,6 +1146,8 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 slot_mapping,
                 block_table,
             )
+            if external_hashes is not None:
+                hashes = self._replace_engram_hash_rows(hashes, external_hashes, external_rows)
             # Engram.forward takes True=keep.
             mask = ~dead
         elif participates:
@@ -1156,6 +1170,32 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
                 )
         return lookups, mask.to(positions.device)
 
+    @staticmethod
+    def _replace_engram_hash_rows(
+        hashes: torch.Tensor,
+        external_hashes: torch.Tensor,
+        external_rows: torch.Tensor,
+    ) -> torch.Tensor:
+        """Take ``external_hashes`` on the rows ``external_rows`` marks.
+
+        Both inputs may be capacity-sized; only the leading hash rows are read.
+        """
+        num_rows = hashes.shape[0]
+        if (
+            external_hashes.dtype != hashes.dtype
+            or external_hashes.shape[0] < num_rows
+            or external_hashes.shape[1:] != hashes.shape[1:]
+            or external_rows.dtype != torch.bool
+            or external_rows.shape[0] < num_rows
+        ):
+            raise ValueError(
+                f"[LWD] external hashes {external_hashes.dtype}{tuple(external_hashes.shape)} / rows "
+                f"{external_rows.dtype}{tuple(external_rows.shape)} do not cover the native hashes "
+                f"{hashes.dtype}{tuple(hashes.shape)}"
+            )
+        rows = external_rows[:num_rows].view(num_rows, 1, 1)
+        return torch.where(rows, external_hashes[:num_rows], hashes)
+
     def prepare_engram_inputs(
         self,
         input_ids,
@@ -1165,6 +1205,9 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
         query_start_loc=None,
         slot_mapping=None,
         block_table=None,
+        *,
+        external_hashes: torch.Tensor | None = None,
+        external_rows: torch.Tensor | None = None,
     ):
         """Synchronously refresh the rows read by this forward, before replay."""
         graph_inputs = self.prepare_engram_graph_inputs(padded_tokens)
@@ -1179,6 +1222,8 @@ class DeepseekV41Model(nn.Module, EagleModelMixin):
             query_start_loc,
             slot_mapping,
             block_table,
+            external_hashes=external_hashes,
+            external_rows=external_rows,
         )
         buffers = graph_inputs["engram_lookups"]
         mask_buffer = graph_inputs["engram_mask"]
@@ -1335,6 +1380,9 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
         query_start_loc=None,
         slot_mapping=None,
         block_table=None,
+        *,
+        external_hashes: torch.Tensor | None = None,
+        external_rows: torch.Tensor | None = None,
     ):
         return self.model.prepare_engram_inputs(
             input_ids,
@@ -1344,6 +1392,8 @@ class AscendDeepseekV41LLMForCausalLM(nn.Module, DeepseekV41MixtureOfExperts, Su
             query_start_loc,
             slot_mapping,
             block_table,
+            external_hashes=external_hashes,
+            external_rows=external_rows,
         )
 
     def prepare_engram_graph_inputs(self, padded_tokens=None):
