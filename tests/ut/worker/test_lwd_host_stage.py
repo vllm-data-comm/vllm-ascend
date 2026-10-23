@@ -56,3 +56,80 @@ def make_req(prompt_rows=10, recv=10, consumed=0) -> "LwdReqEmbed":
         req.note_consumed(consumed)
     return req
 
+
+class TestRewindConsumed(unittest.TestCase):
+    def test_rewind_to_zero_allows_full_reread(self):
+        req = make_req(consumed=6)
+        req.rewind_consumed(0)
+        self.assertEqual(req.consumed, 0)
+        # Arrival high-water mark is untouched: the whole prompt is
+        # dispatchable again.
+        self.assertEqual(req.recv_rows, 10)
+        self.assertEqual(req.available(), 10)
+        # Re-reading from row 0 is legal and hits the retained payload.
+        self.assertEqual(req.read_range(4), (0, 4 * HIDDEN))
+
+    def test_partial_rewind(self):
+        req = make_req(consumed=6)
+        req.rewind_consumed(3)
+        self.assertEqual(req.consumed, 3)
+        self.assertEqual(req.read_range(2), (3 * HIDDEN, 5 * HIDDEN))
+
+    def test_rewind_to_current_pointer_is_noop(self):
+        req = make_req(consumed=6)
+        req.rewind_consumed(6)
+        self.assertEqual(req.consumed, 6)
+
+    def test_rewind_beyond_consumed_raises(self):
+        req = make_req(consumed=6)
+        with self.assertRaises(LwdHostStageGeometryError):
+            req.rewind_consumed(7)
+        with self.assertRaises(LwdHostStageGeometryError):
+            req.rewind_consumed(-1)
+        # Failed rewinds must not move the pointer.
+        self.assertEqual(req.consumed, 6)
+
+    def test_rewind_preserves_arrival_bookkeeping(self):
+        req = make_req(consumed=6)
+        written_hi = req._written_hi
+        req.rewind_consumed(0)
+        self.assertEqual(req.recv_rows, 10)
+        self.assertEqual(req._written_hi, written_hi)
+
+    def test_preemption_recompute_scenario(self):
+        # Prompt fully consumed (decode phase), then preempted: the rewind
+        # reopens the whole prompt and read_range's W2 bound still passes
+        # because recv_rows kept its high-water mark.
+        req = make_req(consumed=10)
+        self.assertTrue(req.done())
+        req.rewind_consumed(0)
+        self.assertFalse(req.done())
+        self.assertEqual(req.read_range(10), (0, 10 * HIDDEN))
+
+
+class TestStagerRewind(unittest.TestCase):
+    def make_stager(self, req) -> "LwdHostStager":
+        stager = LwdHostStager(device="cpu", slots=1, empty_factory=lambda n: None)
+        stager._reqs[req.req_id] = req
+        return stager
+
+    def test_rewind_moves_pointer_and_returns_true(self):
+        req = make_req(consumed=6)
+        stager = self.make_stager(req)
+        self.assertTrue(stager.rewind_consumed("r0", 0))
+        self.assertEqual(stager.consumed_rows("r0"), 0)
+
+    def test_rewind_unknown_request_returns_false(self):
+        stager = self.make_stager(make_req())
+        self.assertFalse(stager.rewind_consumed("gone", 0))
+
+    def test_rewind_out_of_range_propagates(self):
+        req = make_req(consumed=6)
+        stager = self.make_stager(req)
+        with self.assertRaises(LwdHostStageGeometryError):
+            stager.rewind_consumed("r0", 8)
+        self.assertEqual(stager.consumed_rows("r0"), 6)
+
+
+if __name__ == "__main__":
+    unittest.main()
