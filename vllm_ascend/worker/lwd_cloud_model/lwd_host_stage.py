@@ -270,6 +270,10 @@ class LwdReqEmbed:
         )
         self.consumed = to_rows
 
+
+    def mark_aborted(self) -> None:
+        """Freeze the remainder; already-computed rows are history, not undone."""
+        self.aborted = True
     def done(self) -> bool:
         """Nothing more will ever be read from this buffer."""
         return self.aborted or self.consumed >= self.prompt_rows
@@ -715,6 +719,18 @@ class LwdHostStager:
             req.rewind_consumed(to_rows)
         return True
 
+
+    def abort_request(self, req_id: str) -> bool:
+        """Freeze a request's remainder (design §6.3).  Frees nothing by itself."""
+        with self._lock:
+            req = self._reqs.get(req_id)
+            if req is None:
+                return False
+            already = req.aborted
+            req.mark_aborted()
+            if not already:
+                self._aborted_requests += 1
+        return True
     def release_request(self, req_id: str) -> int:
         """Free a request's host storage - called when the **request ends**.
 
