@@ -28,10 +28,14 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
 
 _LWD_WARMUP_NUM_ELEMENTS = 8
 
-# channel -> (device_group, peer_global_rank), on the two endpoint ranks only
-_LWD_CHANNEL_GROUPS: dict[LwdChannelType, tuple[dist.ProcessGroup, int]] = {}
-_LWD_CHANNEL_STREAMS: dict[LwdChannelType, torch.npu.Stream] = {}
-_LWD_ENDPOINTS: LwdChannelEndpoints | None = None
+# (dp_idx, channel) -> (device_group, peer_global_rank), on endpoint ranks
+# only. A shared edge rank serves one cloud DP per key; the cloud endpoints
+# of one DP hold the single key of their own DP.
+_LWD_CHANNEL_GROUPS: dict[
+    tuple[int, LwdChannelType], tuple[dist.ProcessGroup, int]
+] = {}
+_LWD_CHANNEL_STREAMS: dict[tuple[int, LwdChannelType], torch.npu.Stream] = {}
+_LWD_ENDPOINTS: tuple[LwdChannelEndpoints, ...] = ()
 _LWD_CHANNELS_INITIALIZED = False
 
 
@@ -59,8 +63,8 @@ def lwd_init_channels() -> None:
             group = dist.new_group(ranks, backend=backend)
             if my_rank in ranks:
                 peer = endpoints.cloud_rank if my_rank == endpoints.edge_rank else endpoints.edge_rank
-                _LWD_CHANNEL_GROUPS[channel] = (group, peer)
-                _LWD_CHANNEL_STREAMS[channel] = torch.npu.Stream()
+                _LWD_CHANNEL_GROUPS[(endpoints.dp_idx, channel)] = (group, peer)
+                _LWD_CHANNEL_STREAMS[(endpoints.dp_idx, channel)] = torch.npu.Stream()
     _LWD_ENDPOINTS = spec.channel_endpoints_of(my_rank)
     # The cloud-internal embeds broadcast does not build its own group: a
     # dedicated new_group delivered nothing under torch_npu in testing
@@ -89,18 +93,26 @@ def lwd_warm_up_channels() -> None:
     when the first real message is posted. Non-endpoint ranks only join
     the closing world barrier.
     """
-    if _LWD_ENDPOINTS is not None:
-        my_rank = dist.get_rank()
+    my_rank = dist.get_rank()
+    # Connection order, then UP before DOWN: a shared edge rank warms up its
+    # connections one after another, each against a different cloud DP.
+    for endpoints in _LWD_ENDPOINTS:
         for channel in (LwdChannelType.UP, LwdChannelType.DOWN):
-            group, peer = _LWD_CHANNEL_GROUPS[channel]
-            sender = _LWD_ENDPOINTS.edge_rank if channel is LwdChannelType.UP else _LWD_ENDPOINTS.cloud_rank
+            group, peer = _LWD_CHANNEL_GROUPS[(endpoints.dp_idx, channel)]
+            sender = endpoints.edge_rank if channel is LwdChannelType.UP else endpoints.cloud_rank
             payload = torch.zeros(_LWD_WARMUP_NUM_ELEMENTS, dtype=torch.bfloat16, device="npu")
             if my_rank == sender:
                 handle = dist.isend(payload, dst=peer, group=group)
             else:
                 handle = dist.irecv(payload, src=peer, group=group)
             handle.wait()
-            logger.info("[LWD] data-plane warmup done: channel=%s my_rank=%d peer=%d", channel, my_rank, peer)
+            logger.info(
+                "[LWD] data-plane warmup done: dp%d channel=%s my_rank=%d peer=%d",
+                endpoints.dp_idx,
+                channel,
+                my_rank,
+                peer,
+            )
     get_world_group().barrier()
 
 
@@ -108,40 +120,51 @@ def lwd_channels_initialized() -> bool:
     return _LWD_CHANNELS_INITIALIZED
 
 
-def _lwd_channel(channel: LwdChannelType) -> tuple[dist.ProcessGroup, int]:
+def _lwd_channel(
+    channel: LwdChannelType, dp_idx: int
+) -> tuple[dist.ProcessGroup, int]:
     try:
-        return _LWD_CHANNEL_GROUPS[channel]
+        return _LWD_CHANNEL_GROUPS[(dp_idx, channel)]
     except KeyError:
         raise RuntimeError(
-            f"[LWD] rank {dist.get_rank()} holds no {channel.value} channel; "
-            "only the endpoint ranks of a DP connection do"
+            f"[LWD] rank {dist.get_rank()} holds no {channel.value} channel of "
+            f"DP connection {dp_idx}; only the endpoint ranks of a DP "
+            "connection do"
         ) from None
 
 
-def lwd_get_channel_device_group(channel: LwdChannelType) -> dist.ProcessGroup:
-    group, _ = _lwd_channel(channel)
+def lwd_get_channel_device_group(
+    channel: LwdChannelType, dp_idx: int = 0
+) -> dist.ProcessGroup:
+    group, _ = _lwd_channel(channel, dp_idx)
     return group
 
 
-def lwd_get_channel_peer(channel: LwdChannelType) -> int:
+def lwd_get_channel_peer(channel: LwdChannelType, dp_idx: int = 0) -> int:
     """Global rank of this process's P2P peer on the channel."""
-    _, peer = _lwd_channel(channel)
+    _, peer = _lwd_channel(channel, dp_idx)
     return peer
 
 
-def lwd_get_channel_stream(channel: LwdChannelType) -> torch.npu.Stream:
-    _lwd_channel(channel)
-    return _LWD_CHANNEL_STREAMS[channel]
+def lwd_get_channel_stream(
+    channel: LwdChannelType, dp_idx: int = 0
+) -> torch.npu.Stream:
+    _lwd_channel(channel, dp_idx)
+    return _LWD_CHANNEL_STREAMS[(dp_idx, channel)]
 
 
 def lwd_destroy_channels() -> None:
     global _LWD_CHANNELS_INITIALIZED, _LWD_ENDPOINTS
-    for channel, (group, _) in list(_LWD_CHANNEL_GROUPS.items()):
+    for (dp_idx, channel), (group, _) in list(_LWD_CHANNEL_GROUPS.items()):
         try:
             dist.destroy_process_group(group)
         except Exception:
-            logger.warning("[LWD] failed to destroy the data-plane group for %s", channel.value)
+            logger.warning(
+                "[LWD] failed to destroy the data-plane group for dp%d %s",
+                dp_idx,
+                channel.value,
+            )
     _LWD_CHANNEL_GROUPS.clear()
     _LWD_CHANNEL_STREAMS.clear()
-    _LWD_ENDPOINTS = None
+    _LWD_ENDPOINTS = ()
     _LWD_CHANNELS_INITIALIZED = False

@@ -46,12 +46,16 @@ class LwdTransferRequest:
     # at submit time).  recv: None.
     tensor: Any | None = None
     # Per-channel request-level sequence number.  Contract: each
-    # channel's counter starts at 0 and increments by one per request on
-    # both peers; ops are posted to HCCL only once all lower seqnos have
-    # been submitted, so send order and the peer's recv-post order always
-    # agree.  Do not mix sequenced and unsequenced requests on one
-    # channel.
+    # (DP connection, channel) pair's counter starts at 0 and increments
+    # by one per request on both peers; ops are posted to HCCL only once
+    # all lower seqnos have been submitted, so send order and the peer's
+    # recv-post order always agree.  Do not mix sequenced and unsequenced
+    # requests on one channel.
     seqno: int | None = None
+    # DP connection this request belongs to, selecting both the channel
+    # group and the seqno stream.  A shared edge process serves one cloud
+    # DP per index; a cloud process only ever uses its own.  0 at one DP.
+    dp_idx: int = 0
     # Explicit global peer rank; None -> the channel's configured peer.
     peer_rank: int | None = None
     # Optional second payload of the SAME logical request (currently

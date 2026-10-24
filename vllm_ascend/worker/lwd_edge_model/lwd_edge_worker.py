@@ -74,24 +74,32 @@ class LwdEdgeWorker(LwdWorkerBase):
             return None
 
         batch_meta = lwd_batch.batch_meta
+        # The batch names its cloud DP: a shared edge process holds one
+        # UP/DOWN channel pair per cloud DP, each with its own seqno stream.
         if lwd_batch.batch_type == LwdBatchType.LWD_EMBED:
             lwd_logger.info(
-                "[Lwd][edge-worker] EMBED seqno=%d reqs=%d tokens=%d has_mrope=%s",
+                "[Lwd][edge-worker] EMBED dp=%d seqno=%d reqs=%d tokens=%d has_mrope=%s",
+                lwd_batch.dp_idx,
                 lwd_batch.seqno,
                 len(batch_meta.req_ids),
                 sum(len(token_ids) for token_ids in batch_meta.token_ids),
                 batch_meta.has_mrope,
             )
-            return self.model_runner.execute_lwd_embed(lwd_batch.seqno, batch_meta, scheduler_output)
+            return self.model_runner.execute_lwd_embed(
+                lwd_batch.seqno, batch_meta, scheduler_output, lwd_batch.dp_idx
+            )
         if lwd_batch.batch_type == LwdBatchType.LWD_UNEMBED:
             lwd_logger.info(
-                "[Lwd][edge-worker] UNEMBED seqno=%d reqs=%d accepted=%d num_elements=%d",
+                "[Lwd][edge-worker] UNEMBED dp=%d seqno=%d reqs=%d accepted=%d num_elements=%d",
+                lwd_batch.dp_idx,
                 lwd_batch.seqno,
                 len(batch_meta.req_ids),
                 sum(batch_meta.num_accept_tokens),
                 batch_meta.recv_num_elements,
             )
-            result = self.model_runner.execute_lwd_unembed(lwd_batch.seqno, batch_meta)
+            result = self.model_runner.execute_lwd_unembed(
+                lwd_batch.seqno, batch_meta, lwd_batch.dp_idx
+            )
             # [Lwd][eos-trace] Point C: log rows that declared accepted>0
             # yet received no token backfill (paired with edge-side point B
             # by down_seqno; accepted=0 rows legitimately produce no token

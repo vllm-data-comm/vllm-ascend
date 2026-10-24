@@ -15,9 +15,14 @@ from vllm_ascend.ascend_config import get_ascend_config
 
 
 def lwd_mc2_group_ranks(lwd_config: LwdConfig) -> list[list[int]]:
-    """MC2 group ranks: one group per edge instance DP and cloud instance DP.
+    """MC2 group ranks: one group per instance, over all of its ranks.
 
-    These match the vLLM-side EP groups, as the native MC2 groups do.
+    These match the vLLM-side EP groups, as the native MC2 groups do: the
+    MoE all2all rides this group, so at DP > 1 it has to span the DP
+    replicas that hold the other expert shards. A group per TP group would
+    route each token to the experts of one replica only, which produces
+    garbage output rather than an error -- and is indistinguishable from the
+    correct grouping at one DP, where the two coincide.
 
     Raises:
         NotImplementedError: An Ascend feature that derives its groups from
@@ -25,7 +30,7 @@ def lwd_mc2_group_ranks(lwd_config: LwdConfig) -> list[list[int]]:
     """
     _lwd_check_ascend_features()
     spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
-    return [list(group) for group in spec.tp_groups]
+    return [list(group) for group in spec.ep_groups]
 
 
 # TODO(lwd): move this check to NPUPlatform.check_and_update_config, so that

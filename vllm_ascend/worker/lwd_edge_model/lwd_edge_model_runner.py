@@ -147,6 +147,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         seqno: int,
         batch_meta: LwdEmbedBatch,
         scheduler_output: SchedulerOutput,
+        dp_idx: int = 0,
     ) -> None:
         model = self.get_model()
         if not batch_meta.token_ids:
@@ -201,6 +202,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             num_elements=payload.numel(),
             tensor=payload,
             seqno=seqno,
+            dp_idx=dp_idx,
         )
         self.worker.comm_service.submit_send(request)
         # [Lwd][perf] TTFT probes: forward = the embed forward;
@@ -281,7 +283,9 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             self._lwd_engram_prompts.pop(req_id, None)
 
     @torch.inference_mode()
-    def execute_lwd_unembed(self, seqno: int, batch_meta: LwdUnembedBatch) -> ModelRunnerOutput:
+    def execute_lwd_unembed(
+        self, seqno: int, batch_meta: LwdUnembedBatch, dp_idx: int = 0
+    ) -> ModelRunnerOutput:
         model = self.get_model()
         if not batch_meta.req_ids:
             return ModelRunnerOutput(req_ids=[], req_id_to_index={}, sampled_token_ids=[])
@@ -293,6 +297,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
                 op="recv",
                 num_elements=batch_meta.recv_num_elements,  # int = rows_total * hidden_size
                 seqno=seqno,
+                dp_idx=dp_idx,
             )
         )
         _t_post = time.monotonic()

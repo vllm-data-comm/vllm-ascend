@@ -81,23 +81,35 @@ class LwdCloudWorker(LwdWorkerBase):
         self.model_config.enable_prompt_embeds = True
         self.model_runner = LwdCloudModelRunner(self.vllm_config, self.device, worker=self)
         self._init_lwd_data_plane()
-        # Only the endpoint rank (the cloud leader — first rank of the
-        # first cloud DP in the topology) has a cross-node channel: start
-        # its early-recv comm thread. The topology ranks are GLOBAL, while
-        # self.rank is the executor's per-node numbering — the edge card
-        # count offsets them (seen live: local rank 1 of the cloud was
-        # picked as "endpoint", its comm thread then died on "rank 2 holds
-        # no lwd_up channel"). Compare the distributed global rank.
+        # Only the endpoint rank (the leader rank of THIS worker's own cloud
+        # DP) has a cross-node channel: start its early-recv comm thread.
+        # The topology ranks are GLOBAL, while self.rank is the executor's
+        # per-node numbering — the edge card count offsets them (seen live:
+        # local rank 1 of the cloud was picked as "endpoint", its comm
+        # thread then died on "rank 2 holds no lwd_up channel"). Compare the
+        # distributed global rank.
+        #
+        # Reading DP 0's leader instead of this worker's own would leave
+        # every other DP without an endpoint: its leader would take the
+        # "wait for the broadcast" path while being the broadcast source
+        # itself, injecting all-zero embeds into its whole TP group. That
+        # shows up as garbage output, not as an error.
         import torch.distributed as dist
 
         global_rank = dist.get_rank()
-        self._lwd_early_recv_endpoint = global_rank == self.vllm_config.lwd_config.topology.clouds[0].dp[0].ranks[0]
+        lwd_config = self.vllm_config.lwd_config
+        self._lwd_engine_index = self.parallel_config.data_parallel_rank
+        instance = lwd_config.topology.instance("cloud", lwd_config.instance_id)
+        self._lwd_early_recv_endpoint = (
+            global_rank == instance.dp[self._lwd_engine_index].ranks[0]
+        )
         self._lwd_up_hidden_size = self.model_config.get_hidden_size()
         # One log line per cloud rank: which ranks own the comm thread is obvious at a glance.
         lwd_logger.info(
-            "[Lwd][pre-recv] worker local_rank=%d global_rank=%d endpoint=%s hidden=%d",
+            "[Lwd][pre-recv] worker local_rank=%d global_rank=%d dp=%d endpoint=%s hidden=%d",
             self.rank,
             global_rank,
+            self._lwd_engine_index,
             self._lwd_early_recv_endpoint,
             self._lwd_up_hidden_size,
         )
@@ -320,6 +332,8 @@ class LwdCloudWorker(LwdWorkerBase):
             # 0 since mrope retired (zero aux traffic); future payloads
             # (deepstack etc.) just pass their row count
             aux_num_elements=int(aux_rows) * 3,
+            # A cloud process only ever talks to its own DP connection.
+            dp_idx=self._lwd_engine_index,
         )
 
     def _start_lwd_early_recv_thread(self) -> None:
@@ -615,7 +629,8 @@ class LwdCloudWorker(LwdWorkerBase):
             (hidden, meta_dev, seg_lens_host, ready_event, req_ids) = payload
             seqno = self._lwd_next_down_seqno()
             lwd_logger.info(
-                "[Lwd][cloud-worker] DOWN send seqno=%d numel=%d",
+                "[Lwd][cloud-worker] DOWN send dp=%d seqno=%d numel=%d",
+                self._lwd_engine_index,
                 seqno,
                 hidden.numel(),
             )
@@ -626,6 +641,7 @@ class LwdCloudWorker(LwdWorkerBase):
                     num_elements=hidden.numel(),
                     tensor=hidden,
                     seqno=seqno,
+                    dp_idx=self._lwd_engine_index,
                 )
             )
             # Fenced harvest: device-side dependency guarantees the copy

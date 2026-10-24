@@ -34,12 +34,15 @@ class LwdDataPlane:
             return cls._instance
 
     def __init__(self) -> None:
-        # HCCL ordering is per physical (channel, direction): send and
-        # recv have INDEPENDENT seqno streams (each peer's send order must
-        # match the other side's recv-post order), so the FIFO key is
-        # (channel, op) — merging them would make a process's sends and
-        # recvs on one channel collide on a shared seqno counter.
-        self._queues: dict[tuple[LwdChannelType, str], LwdTransferQueue] = {}
+        # HCCL ordering is per physical (DP connection, channel, direction):
+        # send and recv have INDEPENDENT seqno streams (each peer's send
+        # order must match the other side's recv-post order), and every DP
+        # connection is its own pair of channels — so the FIFO key is
+        # (dp_idx, channel, op). Merging any of the three would make seqno
+        # streams collide across directions or cloud DPs.
+        self._queues: dict[
+            tuple[int, LwdChannelType, str], LwdTransferQueue
+        ] = {}
         self._lock = threading.Lock()
         self._shutting_down = False
 
@@ -76,13 +79,19 @@ class LwdDataPlane:
             completed += len(queue.reap())
         return completed
 
-    def skip_seqno(self, channel_type: LwdChannelType, seqno: int, op: str = "recv") -> None:
+    def skip_seqno(
+        self,
+        channel_type: LwdChannelType,
+        seqno: int,
+        op: str = "recv",
+        dp_idx: int = 0,
+    ) -> None:
         """Mark a seqno as never-to-arrive (aborted request) on the given
-        channel+direction FIFO.  Recv managers' drop path passes
+        connection+channel+direction FIFO.  Recv managers' drop path passes
         op="recv"; the sender-side abort glue passes op="send".  Both
-        peers must skip the same seqnos."""
+        peers must skip the same seqnos of the same DP connection."""
         with self._lock:
-            queue = self._queues.get((channel_type, op))
+            queue = self._queues.get((dp_idx, channel_type, op))
         if queue is not None:
             queue.skip_seqno(seqno)
 
@@ -113,11 +122,19 @@ class LwdDataPlane:
         with self._lock:
             if self._shutting_down:
                 raise RuntimeError("lwd-comm service is shutting down")
-            key = (request.channel, request.op)
+            key = (request.dp_idx, request.channel, request.op)
             queue = self._queues.get(key)
             if queue is None:
-                queue = LwdTransferQueue(request.channel, request.op)
+                queue = LwdTransferQueue(
+                    request.channel, request.op, request.dp_idx
+                )
                 self._queues[key] = queue
+                logger.info(
+                    "[lwd-comm] FIFO created dp=%d channel=%s op=%s",
+                    request.dp_idx,
+                    request.channel.value,
+                    request.op,
+                )
         return queue.submit(request)
 
 
