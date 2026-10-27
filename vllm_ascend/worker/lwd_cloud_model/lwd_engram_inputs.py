@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, NamedTuple
 import numpy as np
 import torch
 
+from vllm.lwd_logger import lwd_logger
+
 from vllm_ascend.ops.fused_moe.router.fused_topk_router import DEEPSEEK_V4_IMAGE_SENTINEL_COUNT
 from vllm_ascend.worker.lwd_hash.lwd_up_payload import lwd_engram_payload_dims
 
@@ -384,6 +386,18 @@ class LwdEngramInputs:
         live = (starts >= prompt_lens) & (tail_index >= 0)
         tail_index.clamp_(0, depth - 1)
         window[:num_reqs] = torch.where(live, cells.gather(1, tail_index), _LWD_NO_WINDOW_CELL)
+        # Where the edge's tail ids actually land. The ids can travel intact
+        # and still be read at the wrong column if `tail_index` is off, which
+        # no other log would show; only requests on their tail are listed.
+        for index in live.squeeze(1).nonzero().flatten().tolist():
+            lwd_logger.info(
+                "[engram] cloud window req=%s start=%d prompt=%d tail_index=%s cells=%s",
+                batch.req_ids[index],
+                int(starts[index, 0]),
+                int(prompt_lens[index, 0]),
+                tail_index[index].tolist(),
+                window[index].tolist(),
+            )
         return window
 
     def _window_host(self, batch: LwdEngramBatchView) -> np.ndarray | None:

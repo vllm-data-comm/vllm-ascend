@@ -270,7 +270,21 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
             if prompt is None:
                 raise ValueError(f"[LWD] no registered prompt for Engram hashing of request {req_id}")
             end = start + len(token_ids)
-            chunks.append(self.engram_hasher.prompt_hashes(prompt, start, end))
+            hashes = self.engram_hasher.prompt_hashes(prompt, start, end)
+            # Paired with the cloud's "[engram] cloud up" line. The cloud
+            # replaces its own hashes of these rows with these, so a mismatch
+            # sends every Engram lookup of the chunk to wrong table rows --
+            # which degrades the output without failing anything.
+            lwd_logger.info(
+                "[engram] edge up req=%s rows=[%d,%d) shape=%s l0_first=%s l0_last=%s",
+                req_id,
+                start,
+                end,
+                tuple(hashes.shape),
+                hashes[0, 0].tolist() if hashes.numel() else [],
+                hashes[-1, 0].tolist() if hashes.numel() else [],
+            )
+            chunks.append(hashes)
             if end >= prompt.numel():
                 self._lwd_engram_prompts.pop(req_id)
         return torch.cat(chunks)

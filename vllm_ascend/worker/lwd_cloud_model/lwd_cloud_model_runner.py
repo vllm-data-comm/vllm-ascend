@@ -1031,7 +1031,20 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                         engram.add_prompt_chunk(
                             req_id, start, int(num_prompt[idx]), lwd_engram_record_items(meta, meta_idx)
                         )
-                        engram.write_prompt_hashes(idx, out, engram_hashes[row : row + n])
+                        chunk_hashes = engram_hashes[row : row + n]
+                        # Paired with the edge's "[engram] edge up" line: same
+                        # rows, same layer 0, read off the data plane after
+                        # the UP transfer instead of before it.
+                        lwd_logger.info(
+                            "[engram] cloud up req=%s rows=[%d,%d) shape=%s l0_first=%s l0_last=%s",
+                            req_id,
+                            start,
+                            start + n,
+                            tuple(chunk_hashes.shape),
+                            chunk_hashes[0, 0].tolist() if chunk_hashes.numel() else [],
+                            chunk_hashes[-1, 0].tolist() if chunk_hashes.numel() else [],
+                        )
+                        engram.write_prompt_hashes(idx, out, chunk_hashes)
                     # Write the scheduling window of inputs_embeds.gpu directly on-stream
                     gpu_embeds[out : out + n].copy_(embeds[row : row + n], non_blocking=True)
                     # No D2H write into the CPU assembly buffer anymore:
