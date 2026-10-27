@@ -389,7 +389,8 @@ class LwdEngramInputs:
         # Where the edge's tail ids actually land. The ids can travel intact
         # and still be read at the wrong column if `tail_index` is off, which
         # no other log would show; only requests on their tail are listed.
-        for index in live.squeeze(1).nonzero().flatten().tolist():
+        # `live` is per cell, so reduce it to one flag per request first.
+        for index in live.any(dim=1).nonzero().flatten().tolist():
             lwd_logger.info(
                 "[engram] cloud window req=%s start=%d prompt=%d tail_index=%s cells=%s",
                 batch.req_ids[index],
