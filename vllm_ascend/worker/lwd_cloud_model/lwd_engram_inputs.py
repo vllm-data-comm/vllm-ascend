@@ -464,8 +464,15 @@ class LwdEngramInputs:
         self._records.pop(req_id, None)
 
     def release_consumed(self, requests: Mapping[str, CachedRequestState]) -> None:
-        """Drop records of finished requests and of requests past their prompt tail."""
+        """Drop the records of requests this batch no longer holds.
+
+        Kept while the request is in the batch, rather than dropped once its
+        computed tokens pass the tail: rejected draft tokens roll
+        ``num_computed_tokens`` back (``Scheduler.update_from_output``), so a
+        request can re-enter its look-back window after leaving it, and the
+        drop is not reversible. ``lwd_release_finished`` releases the rest on
+        the engine's signal, which also covers a prefill aborted mid-way.
+        """
         for req_id in list(self._records):
-            request = requests.get(req_id)
-            if request is None or request.num_computed_tokens >= request.num_prompt_tokens + self._tail_reach:
+            if req_id not in requests:
                 del self._records[req_id]
