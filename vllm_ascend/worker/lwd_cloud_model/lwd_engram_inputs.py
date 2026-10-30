@@ -7,9 +7,8 @@ hash (the V4.1 model's ``prepare_engram_inputs``) what the edge sent instead:
 * ``external_hashes`` / ``external_rows``: the edge's bucket indices of this
   step's prompt rows (UP payload), replacing the native hashes of those rows;
 * the lookback window: for decode steps whose n-gram still reaches the
-  prompt, the prompt tail's compressed ids (control plane, once per request)
-  as representative raw ids, which the unchanged native kernel maps back to
-  the same compressed ids;
+  prompt, the ids of the prompt tail, looked back up from the embeddings the
+  tail rows already carry on the UP payload (``LwdEmbedLookup``);
 * the model ``input_ids``: real ids on decode rows, 0 on prompt rows except
   the public image placeholder ids that MoE ``bias_vl`` and the Engram dead
   mask read.
@@ -32,6 +31,7 @@ import torch
 from vllm.lwd_logger import lwd_logger
 
 from vllm_ascend.ops.fused_moe.router.fused_topk_router import DEEPSEEK_V4_IMAGE_SENTINEL_COUNT
+from vllm_ascend.worker.lwd_cloud_model.lwd_embed_lookup import LWD_NO_EMBED_ROW, LwdEmbedLookup
 from vllm_ascend.worker.lwd_hash.lwd_up_payload import lwd_engram_payload_dims
 
 if TYPE_CHECKING:
@@ -42,8 +42,6 @@ if TYPE_CHECKING:
 
 LwdStageToDevice = Callable[[np.ndarray, int], torch.Tensor]
 """``LwdPinnedStaging.stage_to_device``: stage a host array, return its device view."""
-LwdEngramRecordItems = tuple[list[int], list[bool], list[int]]
-"""One request's (tail compressed ids, tail dead flags, image placeholder spans)."""
 
 _LWD_HASHED_ROW = -1
 """Row code of rows the cloud hashes itself: decode, draft and padding rows."""
@@ -51,8 +49,6 @@ _LWD_PROMPT_ID = 0
 """Information-free model input id of prompt rows."""
 _LWD_NO_WINDOW_CELL = -1
 """Window cell that is not a prompt cell, as in the native lookback window."""
-_LWD_NO_RAW_ID = -1
-"""Representative of a compressed id that only image placeholder ids map to."""
 _LWD_SPAN_FIELDS = 3
 """An image placeholder span is (start, length, token_id)."""
 
@@ -102,71 +98,72 @@ class LwdEngramBatchView(NamedTuple):
     num_prompt_tokens: np.ndarray
 
 
-@dataclass(frozen=True)
+@dataclass
 class _LwdEngramRecord:
+    image_spans: np.ndarray
+    """int64 [num_spans, 3], from the request's first chunk."""
     tail_cells: np.ndarray
     """int64 [lookback_depth] window values of prompt positions ``P - 1 - t``."""
-    image_spans: np.ndarray
-    """int64 [num_spans, 3]."""
+    tail_filled: np.ndarray
+    """bool [lookback_depth], True once the cell holds its final value.
+
+    A tail position is filled by the chunk that carries its embedding, which
+    is not always the last one: a chunk boundary can split the tail. Cells of
+    positions before the prompt start need no chunk and start out filled.
+    """
+
+    @property
+    def tail_complete(self) -> bool:
+        return bool(self.tail_filled.all())
 
 
-def lwd_engram_token_map(model: nn.Module) -> torch.Tensor:
-    """The raw-to-compressed id map of the model's native Engram hash state.
+def lwd_embed_lookup(model: nn.Module) -> LwdEmbedLookup:
+    """Reverse lookup of the model's own token embedding table.
+
+    The table is taken by name, not by type: the LM head and the Engram tables
+    are vocabulary embeddings too, and only this one is what the edge embedded
+    the prompt with.
 
     Raises:
-        ValueError: The model has no Engram hash state.
+        ValueError: The model has no token embedding table.
     """
-    # Imported here: the module pulls in the DeepSeek V4.1 model package,
-    # which only Engram models load.
-    from vllm.models.deepseek_v41.common.engram import NgramHashState
+    # Imported here: the module pulls in the vocabulary embedding layer, whose
+    # import chain only a loaded model needs.
+    from vllm.model_executor.layers.vocab_parallel_embedding import VocabParallelEmbedding
 
-    hash_state = next((module for module in model.modules() if isinstance(module, NgramHashState)), None)
-    if hash_state is None:
-        raise ValueError("[LWD] the cloud model has Engram layers but no Engram hash state")
-    return hash_state.token_map
-
-
-def lwd_representative_ids(token_map: torch.Tensor, excluded_ids: Sequence[int]) -> np.ndarray:
-    """Smallest raw id of each compressed id, skipping ``excluded_ids``.
-
-    Args:
-        token_map: Raw id -> compressed id map of the native hash state.
-        excluded_ids: Raw ids never chosen, since the native dead mask turns
-            them into pads.
-
-    Returns:
-        Host int64 ``[compressed vocab size]``; ``_LWD_NO_RAW_ID`` where only
-        excluded ids map to the compressed id.
-    """
-    compressed_ids = token_map.cpu().long()
-    num_raw_ids = compressed_ids.numel()
-    raw_ids = torch.arange(num_raw_ids)
-    candidates = raw_ids.masked_fill(torch.isin(raw_ids, torch.tensor(list(excluded_ids))), num_raw_ids)
-    table = torch.full((int(compressed_ids.max()) + 1,), num_raw_ids, dtype=torch.int64)
-    table.scatter_reduce_(0, compressed_ids, candidates, reduce="amin")
-    return table.masked_fill_(table == num_raw_ids, _LWD_NO_RAW_ID).numpy()
-
-
-def lwd_engram_record_items(meta: LwdEmbedBatch, index: int) -> LwdEngramRecordItems:
-    """Request ``index``'s Engram record lists; empty when the batch carries none."""
-    return (
-        meta.engram_tail_compressed_ids[index] if meta.engram_tail_compressed_ids else [],
-        meta.engram_tail_dead[index] if meta.engram_tail_dead else [],
-        meta.image_placeholder_spans[index] if meta.image_placeholder_spans else [],
+    embedding = next(
+        (
+            module
+            for name, module in model.named_modules()
+            if name.endswith("embed_tokens") and isinstance(module, VocabParallelEmbedding)
+        ),
+        None,
     )
+    if embedding is None:
+        raise ValueError("[LWD] the cloud model has Engram layers but no token embedding table")
+    return LwdEmbedLookup(
+        embedding.weight,
+        embedding.shard_indices.org_vocab_start_index,
+        embedding.org_vocab_size,
+    )
+
+
+def lwd_engram_image_spans(meta: LwdEmbedBatch, index: int) -> list[int]:
+    """Request ``index``'s image placeholder spans; empty when the batch carries none."""
+    return meta.image_placeholder_spans[index] if meta.image_placeholder_spans else []
 
 
 def lwd_check_engram_record_lists(meta: LwdEmbedBatch, has_engram: bool) -> None:
     """Fail fast on Engram record lists the batch layout cannot carry.
 
     Raises:
-        ValueError: A list is neither empty nor one entry per request, or a
+        ValueError: The list is neither empty nor one entry per request, or a
             model without Engram receives records.
     """
-    lists = (meta.engram_tail_compressed_ids, meta.engram_tail_dead, meta.image_placeholder_spans)
-    if any(values and len(values) != len(meta.req_ids) for values in lists):
+    spans = meta.image_placeholder_spans
+    if spans and len(spans) != len(meta.req_ids):
         raise ValueError("[LWD] Engram record lists must be empty or hold one entry per request")
-    if not has_engram and any(any(values) for values in lists):
+    if not has_engram and any(spans):
         raise ValueError("[LWD] received Engram records for a cloud model without Engram layers")
 
 
@@ -180,27 +177,28 @@ class LwdEngramInputs:
     def __init__(
         self,
         dims: LwdEngramDims,
-        token_map: torch.Tensor,
+        device: torch.device,
+        embed_lookup: LwdEmbedLookup,
         max_num_tokens: int,
         max_num_reqs: int,
         num_spec_tokens: int,
     ) -> None:
-        """Build the representative id table and allocate the step buffers.
+        """Allocate the step buffers.
 
         Args:
             dims: Engram dimensions of the cloud model.
-            token_map: Raw id -> compressed id map of the native hash state;
-                the step buffers live on its device, the model's.
+            device: Device of the model, holding the step buffers.
+            embed_lookup: Reverse lookup of the cloud's embedding table, which
+                recovers the ids of the prompt tail.
             max_num_tokens: Row capacity of one step.
             max_num_reqs: Request capacity of one step.
             num_spec_tokens: Draft tokens per request and step.
         """
-        device = token_map.device
         self.dims = dims
         # The real chunk start trails the CPU count by at most the drafts, so
         # the tail can be needed while the CPU count is below this reach.
         self._tail_reach = dims.lookback_depth + num_spec_tokens
-        self._representative_ids = lwd_representative_ids(token_map, (dims.image_token_id, dims.image_pad_token_id))
+        self._embed_lookup = embed_lookup
         self._records: dict[str, _LwdEngramRecord] = {}
         self._hashes = torch.zeros(
             max_num_tokens, dims.num_layers, dims.num_hash_cols, dtype=torch.int32, device=device
@@ -219,27 +217,104 @@ class LwdEngramInputs:
         req_id: str,
         start: int,
         prompt_len: int,
-        record_items: LwdEngramRecordItems,
+        spans: list[int],
+        embeds: torch.Tensor,
     ) -> None:
-        """Store the request's record from its first chunk; later chunks carry none.
+        """Record the request's image spans, and its tail once the tail arrives.
+
+        The spans ride the first chunk. The tail is the last ``lookback_depth``
+        prompt positions, so its ids are looked up from the embeddings of the
+        chunk that holds them, which is the last one.
+
+        Args:
+            req_id: The request this chunk belongs to.
+            start: Prompt offset of the chunk.
+            prompt_len: Prompt tokens of the request.
+            spans: Flattened image placeholder spans, on the first chunk only.
+            embeds: ``[chunk tokens, hidden]`` UP embeddings of this chunk.
 
         Raises:
-            ValueError: The record is missing, malformed, duplicated, or rides
-                a chunk other than the first.
+            ValueError: The spans are missing, malformed, duplicated, or ride a
+                chunk other than the first.
         """
-        compressed_ids, dead, spans = record_items
-        if start != 0:
-            if compressed_ids or dead or spans:
-                raise ValueError(f"[LWD] {req_id} carries an Engram record on its chunk at offset {start}")
-            return
-        if req_id in self._records:
-            raise ValueError(f"[LWD] duplicate Engram record for {req_id}")
+        if start == 0:
+            if req_id in self._records:
+                raise ValueError(f"[LWD] duplicate Engram record for {req_id}")
+            self._records[req_id] = self._new_record(req_id, prompt_len, spans)
+        elif spans:
+            raise ValueError(f"[LWD] {req_id} carries an Engram record on its chunk at offset {start}")
+        record = self._records.get(req_id)
+        if record is None:
+            raise ValueError(f"[LWD] {req_id} has no Engram record on its chunk at offset {start}")
+        self._fill_tail(req_id, record, start, prompt_len, embeds)
+
+    def _new_record(self, req_id: str, prompt_len: int, spans: list[int]) -> _LwdEngramRecord:
+        """A record with its image spans and an empty tail.
+
+        Image positions take ``image_token_id`` straight away: the native dead
+        mask reads it as a pad, and their embedding is a vision tower output
+        that is in no table to look up. Positions before the prompt start keep
+        ``_LWD_NO_WINDOW_CELL``, as in the native window.
+        """
         depth = self.dims.lookback_depth
-        if len(compressed_ids) != depth or len(dead) != depth:
+        image_spans = self._image_spans(req_id, prompt_len, spans)
+        positions = prompt_len - 1 - np.arange(depth)
+        image = (positions >= 0) & self._spans_cover(image_spans, positions)
+        return _LwdEngramRecord(
+            image_spans=image_spans,
+            tail_cells=np.where(image, self.dims.image_token_id, _LWD_NO_WINDOW_CELL),
+            tail_filled=image | (positions < 0),
+        )
+
+    def _fill_tail(
+        self,
+        req_id: str,
+        record: _LwdEngramRecord,
+        start: int,
+        prompt_len: int,
+        embeds: torch.Tensor,
+    ) -> None:
+        """Look up the tail ids this chunk carries the embeddings of.
+
+        A chunk boundary can fall inside the tail, so each chunk fills the tail
+        positions it holds and the record completes over as many chunks as the
+        tail spans.
+
+        Raises:
+            ValueError: A tail row matches no row of the embedding table.
+        """
+        positions = prompt_len - 1 - np.arange(self.dims.lookback_depth)
+        mine = ~record.tail_filled & (positions >= start) & (positions < start + embeds.shape[0])
+        if not mine.any():
+            return
+        rows = torch.from_numpy(positions[mine] - start).to(embeds.device)
+        ids = self._embed_lookup.lookup(embeds[rows])
+        if any(id_ == LWD_NO_EMBED_ROW for id_ in ids):
             raise ValueError(
-                f"[LWD] Engram tail of {req_id} has {len(compressed_ids)} compressed ids and {len(dead)} dead "
-                f"flags, expected {depth} each"
+                f"[LWD] Engram tail of {req_id} at prompt positions {positions[mine].tolist()} holds "
+                f"{ids.count(LWD_NO_EMBED_ROW)} embedding row(s) matching no row of the cloud's embedding "
+                "table: the edge and the cloud serve different weights, or the rows arrived corrupted"
             )
+        record.tail_cells[mine] = ids
+        record.tail_filled[mine] = True
+        if record.tail_complete:
+            # Paired with the edge's "[engram] edge tail" line: the ids the
+            # cloud recovers have to be the ids the edge hashed, or the
+            # look-back window lands on wrong table rows, which nothing but
+            # the accuracy would show.
+            lwd_logger.info(
+                "[engram] cloud tail req=%s prompt=%d ids=%s",
+                req_id,
+                prompt_len,
+                record.tail_cells.tolist(),
+            )
+
+    def _image_spans(self, req_id: str, prompt_len: int, spans: list[int]) -> np.ndarray:
+        """Validated int64 ``[num_spans, 3]`` of ``(start, length, token_id)``.
+
+        Raises:
+            ValueError: The spans are malformed or fall outside the prompt.
+        """
         if len(spans) % _LWD_SPAN_FIELDS:
             raise ValueError(f"[LWD] image placeholder spans of {req_id} are not (start, length, id) triples")
         image_spans = np.asarray(spans, dtype=np.int64).reshape(-1, _LWD_SPAN_FIELDS)
@@ -249,37 +324,15 @@ class LwdEngramInputs:
                 f"[LWD] image placeholder spans of {req_id} must lie inside its {prompt_len}-token prompt "
                 "and carry image placeholder ids"
             )
-        self._records[req_id] = _LwdEngramRecord(
-            tail_cells=self._tail_cells(req_id, prompt_len, compressed_ids, dead),
-            image_spans=image_spans,
-        )
+        return image_spans
 
-    def _tail_cells(
-        self,
-        req_id: str,
-        prompt_len: int,
-        compressed_ids: list[int],
-        dead: list[bool],
-    ) -> np.ndarray:
-        """Window values of the tail: representative ids, ``image_token_id`` if dead.
-
-        Entries before the prompt start are ``_LWD_NO_WINDOW_CELL``.
-
-        Raises:
-            ValueError: A tail id is outside the compressed vocab, or only
-                image placeholder ids map to it.
-        """
-        ids = np.asarray(compressed_ids, dtype=np.int64)
-        vocab_size = self._representative_ids.size
-        if ((ids < 0) | (ids >= vocab_size)).any():
-            raise ValueError(
-                f"[LWD] Engram tail ids {ids.tolist()} of {req_id} lie outside the compressed vocab [0, {vocab_size})"
-            )
-        cells = np.where(np.asarray(dead, dtype=bool), self.dims.image_token_id, self._representative_ids[ids])
-        cells[prompt_len:] = _LWD_NO_WINDOW_CELL
-        if (cells[:prompt_len] == _LWD_NO_RAW_ID).any():
-            raise ValueError(f"[LWD] Engram tail ids {ids.tolist()} of {req_id} include one with no non-image raw id")
-        return cells
+    @staticmethod
+    def _spans_cover(image_spans: np.ndarray, positions: np.ndarray) -> np.ndarray:
+        """Which ``positions`` fall in an image placeholder span."""
+        if not image_spans.size:
+            return np.zeros(positions.size, dtype=bool)
+        starts, lengths = image_spans[:, 0, None], image_spans[:, 1, None]
+        return ((positions >= starts) & (positions < starts + lengths)).any(axis=0)
 
     def write_prompt_hashes(self, batch_index: int, out: int, hashes: torch.Tensor) -> None:
         """Copy one request's UP bucket indices to its rows starting at ``out``."""
@@ -419,7 +472,7 @@ class LwdEngramInputs:
         for index in np.flatnonzero(reachable):
             req_id = batch.req_ids[index]
             record = self._records.get(req_id)
-            if record is None:
+            if record is None or not record.tail_complete:
                 raise ValueError(f"[LWD] {req_id} reaches its prompt tail without an Engram record")
             cells[index] = record.tail_cells
         return host

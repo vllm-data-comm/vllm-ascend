@@ -30,8 +30,8 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_engram_inputs import (
     LwdEngramInputs,
     LwdStageToDevice,
     lwd_check_engram_record_lists,
-    lwd_engram_record_items,
-    lwd_engram_token_map,
+    lwd_embed_lookup,
+    lwd_engram_image_spans,
 )
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import LwdHashRoutingState, hash_layer_count
@@ -157,7 +157,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             return
         self.lwd_engram_inputs = LwdEngramInputs(
             engram_dims,
-            lwd_engram_token_map(self.get_model()),
+            self.device,
+            lwd_embed_lookup(self.get_model()),
             self.max_num_tokens,
             self.max_num_reqs,
             self.num_spec_tokens,
@@ -1029,7 +1030,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                         if engram_hashes is None:
                             raise ValueError(f"[LWD] missing Engram UP hashes for {req_id}")
                         engram.add_prompt_chunk(
-                            req_id, start, int(num_prompt[idx]), lwd_engram_record_items(meta, meta_idx)
+                            req_id,
+                            start,
+                            int(num_prompt[idx]),
+                            lwd_engram_image_spans(meta, meta_idx),
+                            embeds[row : row + n],
                         )
                         chunk_hashes = engram_hashes[row : row + n]
                         # Paired with the edge's "[engram] edge up" line: same
