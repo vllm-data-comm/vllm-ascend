@@ -151,6 +151,7 @@ class LwdCloudWorker(LwdWorkerBase):
             self.rank,
             time.monotonic(),
         )
+        self._lwd_up_post_recvs(scheduler_output)
 
         # finished_req_ids releases runner and host-stage request state.
         if scheduler_output.finished_req_ids:
@@ -167,6 +168,19 @@ class LwdCloudWorker(LwdWorkerBase):
             (time.monotonic() - _t0) * 1000,
         )
         return output
+
+    def _lwd_up_post_recvs(self, scheduler_output: SchedulerOutput) -> None:
+        """Apply abort notices carried by normal or abort-only scheduler batches."""
+        from vllm.v1.core.sched.output import LwdBatchType
+
+        batch = getattr(scheduler_output, "lwd_batch", None)
+        if batch is None or batch.batch_type is not LwdBatchType.LWD_EMBED:
+            return
+        meta = batch.batch_meta
+        if meta is None or self._lwd_stager is None:
+            return
+        for req_id in meta.aborted_req_ids or ():
+            self._lwd_stager.abort_request(req_id)
 
     # ------------------------------------------------------------------ #
     # Early receive: comm thread (hint -> post recv -> report watermark) #
