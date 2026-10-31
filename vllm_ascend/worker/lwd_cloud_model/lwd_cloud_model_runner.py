@@ -25,6 +25,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
+from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
     hash_layer_count,
@@ -103,6 +104,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     ) -> None:
         super().__init__(vllm_config, device, worker)
         self._lwd_pending_down_payload = None
+        self._lwd_token_rank_encoder = LwdTokenRankEncoder()
         # Row-slot residue cleanup: flush reused rows as soon as a request
         # is admitted (2026-10-21 MTE root-cause closure)
         self._lwd_reset_reused_rows_on_admission()
@@ -194,7 +196,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         batch._lwd_row_reset_hooked = True
         orig_add = batch.add_request
 
-        def add_request_then_reset_row(request):
+        def add_request_then_reset_row(request: CachedRequestState) -> int:
             req_index = orig_add(request)
             self._lwd_reset_reused_row(request, req_index)
             return req_index
@@ -1188,8 +1190,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         full_cover = all(valid[: len(batch_req_ids)])
         lg_sel = logits if full_cover else logits[idx]
         sm_sel = sampled[:, 0] if full_cover else sampled[idx][:, 0]
-        thresh = lg_sel.gather(1, sm_sel.long().unsqueeze(1))
-        ranks = [(lg_sel > thresh).sum(dim=1).to(torch.int32)]
+        ranks = [self._lwd_token_rank_encoder.encode(lg_sel, sm_sel)]
         hidden_packet = torch.cat([sample_hidden_states[i : i + 1] for i in idx])
         return LwdDownSelection(
             hidden_packet=hidden_packet,
@@ -1265,8 +1266,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         else:
             lg_rows = logits[sel_d]
             hidden_packet = sample_hidden_states[sel_d]
-        thresh = lg_rows.gather(1, sampled_rows.long().unsqueeze(1))
-        ranks = [(lg_rows > thresh).sum(dim=1).to(torch.int32)]
+        ranks = [self._lwd_token_rank_encoder.encode(lg_rows, sampled_rows)]
         # Stale sampled slots (requests the spec step skipped may retain
         # the previous spec step's tokens): accepted/ranks/seg_lens are
         # all capped by the actual hidden row count — the row count is

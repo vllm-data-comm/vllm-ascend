@@ -39,8 +39,9 @@ def select_token_batch(logits: torch.Tensor, ranks: list[int]) -> list[int]:
 
     logits [R,V] rows sorted together (NPU sorts rows in parallel);
     sorted_idx[i, ranks[i]] is the token id at rank ranks[i] for row i.
+    Stable sorting preserves ascending token-ID order for equal logits.
     """
-    _, sorted_idx = torch.sort(logits, dim=-1, descending=True)
+    _, sorted_idx = torch.sort(logits, dim=-1, descending=True, stable=True)
     row = torch.arange(len(ranks), device=logits.device)
     return sorted_idx[row, torch.tensor(ranks, device=logits.device)].tolist()
 
