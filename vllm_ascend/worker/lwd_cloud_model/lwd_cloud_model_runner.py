@@ -355,9 +355,29 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     # overrides; the base classes carry no seams.                       #
     # ------------------------------------------------------------------ #
 
+    def _lwd_rewind_preempted_requests(self, scheduler_output: SchedulerOutput) -> None:
+        """Align host read pointers with scheduler rollbacks before native updates."""
+        worker = self.worker
+        if worker is None or not worker._lwd_early_recv_endpoint:
+            return
+        stager = worker._lwd_stager
+        if stager is None:
+            return
+        cached = scheduler_output.scheduled_cached_reqs
+        for req_id, new_computed in zip(cached.req_ids, cached.num_computed_tokens):
+            consumed = stager.consumed_rows(req_id)
+            if consumed > new_computed:
+                stager.rewind_consumed(req_id, new_computed)
+                lwd_logger.info(
+                    "[LWD][cloud-runner] REWIND req=%s: host read pointer "
+                    "%d -> %d (preemption recompute; payload retained)",
+                    req_id,
+                    consumed,
+                    new_computed,
+                )
+
     def _update_states(self, scheduler_output: SchedulerOutput) -> Callable[[], None] | None:
-        """LWD: materialize meta placeholder embeds in place before they
-        reach the base (zero base seams).
+        """Rewind preempted host reads and materialize meta placeholders.
 
         The engine attaches prompt embeds as meta tensors (shape only,
         empty storage), so the placeholder rides the MQ inline pickle
@@ -367,6 +387,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         allocations here, native path behavior unchanged.
         NOTE: a meta tensor still reports full nbytes (numel * element_size);
         do not infer transport cost from nbytes."""
+        self._lwd_rewind_preempted_requests(scheduler_output)
         for new_req in scheduler_output.scheduled_new_reqs:
             embeds = new_req.prompt_embeds
             if embeds is not None and embeds.is_meta:
