@@ -17,10 +17,10 @@ Pure AST scan over source files: no torch/NPU needed, runs on any checkout.
 from __future__ import annotations
 
 import ast
-import re
 from pathlib import Path
 
 import pytest
+import regex as re
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
