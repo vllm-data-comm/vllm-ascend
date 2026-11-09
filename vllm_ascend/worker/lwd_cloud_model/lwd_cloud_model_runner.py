@@ -797,9 +797,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     assert req is not None
                     tail_start, _ = req.tail_range_at(window.start, window.rows)
                     numel = window.rows * tail_per_row
-                    dev[tail_offset : tail_offset + numel].copy_(
+                    # Same first-copy-loss risk, same helper (expert-ID bytes
+                    # may legitimately be zero: retry only, no fail-fast).
+                    self._lwd_h2d_copy_verified(
+                        dev[tail_offset : tail_offset + numel],
                         req.host[tail_start : tail_start + numel],
-                        non_blocking=True,
+                        window.req_id,
+                        strict=False,
                     )
                     tail_offset += numel
             ready_event = torch.npu.Event()
@@ -813,6 +817,59 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             len(plan),
             (time.monotonic() - started) * 1000,
         )
+
+    def _lwd_h2d_copy_verified(
+        self, dst: torch.Tensor, src: torch.Tensor, rid: str, strict: bool = True
+    ) -> None:
+        """Pinned-to-device-window H2D copy (sync + read-back check + one retry).
+
+        Root-cause fix for the 2E2C cold-start first window (2026-11, ported
+        from cr_mi_to_23.0_azy_1029_memc b471c205b): right after a segmented
+        D2H lands the edge prompt embeddings in a pinned buffer, the **first**
+        ``copy_`` issued in the H2D stream context can be silently dropped by
+        torch_npu (first-read transient) — the source was verified non-zero,
+        the window memory is writable, and an immediate same-parameter retry
+        recovers bit-for-bit. A lost first copy hands the model all-zero
+        embeddings, degrading the output to an unconditional continuation
+        from BOS ("answers an unrelated question"): only the first few
+        requests after startup, only on non-group-leader endpoint ranks,
+        self-heals afterwards, no error anywhere.
+
+        The check sums the first 16 destination elements: real embedding rows
+        are never all-zero (first row measured 0.12/-0.03/...), so legitimate
+        input cannot trip it. ``strict=False`` is for the expert-ID tail
+        (bytes may legitimately be zero): retry only, never fail; the retry
+        is idempotent. In steady state D2H finished long ago, the first read
+        passes and the retry branch never fires; the standing cost is one
+        blocking copy plus one 16-element read-back on the H2D stream.
+
+        Sync scope: the read-back only needs the *issuing* stream drained,
+        which the blocking ``copy_`` already guarantees, so a stream-level
+        synchronize suffices. Cross-stream visibility towards the compute
+        stream is owned by the ``ready_event`` bridge recorded after the
+        window is staged. A device-wide ``torch.npu.synchronize()`` would
+        additionally park the engine thread behind every unrelated
+        in-flight stream (previous window's forward tail, DOWN sends,
+        early-recv HCCL ops) at each staging point with no correctness
+        gain, and is deliberately avoided here.
+        """
+        dst.copy_(src, non_blocking=False)
+        torch.npu.current_stream().synchronize()
+        if float(dst[:16].float().sum().item()) != 0.0:
+            return
+        lwd_logger.warning(
+            "[Lwd][cloud-runner] H2D first-copy lost req=%s "
+            "(dst head zero after sync copy; retrying)",
+            rid,
+        )
+        dst.copy_(src, non_blocking=False)
+        torch.npu.current_stream().synchronize()
+        if strict and float(dst[:16].float().sum().item()) == 0.0:
+            raise RuntimeError(
+                f"[Lwd][cloud-runner] H2D copy lost twice req={rid} "
+                f"(src_sum={float(src[:16].float().sum())}, dst stays "
+                f"zero after retry)"
+            )
 
     def _lwd_h2d_stream(self) -> torch.npu.Stream:
         """Return the dedicated stream used for host-window copies."""
@@ -870,9 +927,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             raise RuntimeError(f"[Lwd][cloud-runner] invalid host window for {window.req_id}")
         req = stager.take_req(window.req_id)
         assert req is not None
-        dev[elem_offset : elem_offset + numel].copy_(
+        # Cold-start first-window silent copy loss: verify + retry (see helper).
+        self._lwd_h2d_copy_verified(
+            dev[elem_offset : elem_offset + numel],
             req.host[host_start : host_start + numel],
-            non_blocking=True,
+            window.req_id,
         )
 
     def _lwd_inject_remote_embeds(
