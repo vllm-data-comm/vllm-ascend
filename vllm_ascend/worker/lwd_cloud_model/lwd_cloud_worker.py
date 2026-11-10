@@ -91,7 +91,9 @@ class LwdCloudWorker(LwdWorkerBase):
         self._lwd_up_tail_sizes = self._lwd_up_layout.tail_sizes_per_token
         # Splits the engine's exec_rpc, which is one number from the step
         # thread's side of the round trip.
-        self._lwd_worker_meter = LwdCloudWorkerMeter(global_rank, self._lwd_dp_idx)
+        self._lwd_worker_meter = LwdCloudWorkerMeter(
+            global_rank, self._lwd_dp_idx, self._lwd_early_recv_endpoint
+        )
         if self._lwd_early_recv_endpoint:
             self._lwd_init_lwd_host_stager()
             self._start_lwd_early_recv_thread()
@@ -474,21 +476,21 @@ class LwdCloudWorker(LwdWorkerBase):
             collect_s = self.model_runner.take_lwd_collect_seconds()
             self._lwd_worker_meter.note_sample(
                 native_s=max(0.0, (_t_sample - _t0) - collect_s),
-                collect_s=collect_s,
-                submit_s=time.monotonic() - _t_sample,
-                seqno=seqno,
-                rows=hidden.shape[0] if hidden is not None else 0,
+                down=(
+                    collect_s,
+                    time.monotonic() - _t_sample,
+                    seqno,
+                    hidden.shape[0] if hidden is not None else 0,
+                ),
             )
         else:
             # Only the DOWN endpoint rank collects and sends; the others
             # still close their step here, or their execute halves would
-            # accumulate against a step count that never advances.
+            # accumulate against a step count that never advances. They
+            # report no DOWN work rather than zero of it.
             self._lwd_worker_meter.note_sample(
                 native_s=_t_sample - _t0,
-                collect_s=0.0,
-                submit_s=0.0,
-                seqno=-1,
-                rows=0,
+                down=None,
             )
         return output
 
