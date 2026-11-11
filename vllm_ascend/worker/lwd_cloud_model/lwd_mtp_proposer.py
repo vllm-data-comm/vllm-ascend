@@ -8,6 +8,9 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+from vllm_ascend.spec_decode.multi_kv_cache_group_proposer import (
+    AscendMultiKVCacheGroupMTPProposer,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import CommonAttentionMetadata
@@ -48,3 +51,15 @@ class LwdMTPProposer(AscendEagleProposer):
         if enabled and needs_prompt and result is None:
             raise RuntimeError("LWD prefix MTP requires authoritative prompt embeddings")
         return result
+
+
+class LwdMultiKVCacheGroupMTPProposer(LwdMTPProposer, AscendMultiKVCacheGroupMTPProposer):
+    """LWD MTP drafter for drafts split across physical KV cache groups.
+
+    Both parents derive from ``AscendEagleProposer`` and override disjoint
+    axes: ``LwdMTPProposer`` adapts externally supplied LWD embeddings
+    (the embedding axis), ``AscendMultiKVCacheGroupMTPProposer`` widens
+    attention metadata to per-physical-group views (the attention-group
+    axis). The class is a pure MRO composition; single-group drafts fall
+    back to the inherited base paths via ``_uses_multi_group_kv_cache``.
+    """

@@ -529,5 +529,55 @@ class TestExternalEmbeddingSP(unittest.TestCase):
             mtp._run_merged_draft(3, 1, None, positions, embeds[:2], None, 3)
 
 
+class TestDrafterRouting(unittest.TestCase):
+    """_get_drafter routes drafts split across physical KV cache groups
+    (e.g. ``glm5_next_mtp``) through the composite adapter while keeping the
+    single-group LWD adapter for DSV4-style drafts."""
+
+    def _drafter_for(self, lwd_config, multi_group, method="mtp", step35=False):
+        built = []
+
+        class FakeLwdProposer:
+            def __init__(self, vllm_config, device, runner):
+                built.append("lwd")
+
+        class FakeMultiGroupProposer:
+            def __init__(self, vllm_config, device, runner):
+                built.append("multi")
+
+        class Base:
+            def _get_drafter(self):
+                return "base-drafter"
+
+        runner_cls = load_methods(
+            RUNNER,
+            {"_get_drafter"},
+            Base,
+            LwdMTPProposer=FakeLwdProposer,
+            LwdMultiKVCacheGroupMTPProposer=FakeMultiGroupProposer,
+            is_multi_kv_cache_group_mtp=lambda vllm_config: multi_group,
+        )
+        runner = runner_cls()
+        runner.vllm_config = NS(lwd_config=lwd_config)
+        runner.speculative_config = NS(method=method, use_step3p5_mtp=lambda: step35)
+        return runner._get_drafter(), built
+
+    def test_multi_group_draft_uses_composite_proposer(self):
+        _, built = self._drafter_for(lwd_config=object(), multi_group=True)
+        self.assertEqual(built, ["multi"])
+
+    def test_single_group_draft_keeps_lwd_proposer(self):
+        _, built = self._drafter_for(lwd_config=object(), multi_group=False)
+        self.assertEqual(built, ["lwd"])
+
+    def test_step35_and_non_lwd_fall_back_to_base(self):
+        drafter, built = self._drafter_for(lwd_config=object(), multi_group=True, step35=True)
+        self.assertEqual(built, [])
+        self.assertEqual(drafter, "base-drafter")
+        drafter, built = self._drafter_for(lwd_config=None, multi_group=True)
+        self.assertEqual(built, [])
+        self.assertEqual(drafter, "base-drafter")
+
+
 if __name__ == "__main__":
     unittest.main()

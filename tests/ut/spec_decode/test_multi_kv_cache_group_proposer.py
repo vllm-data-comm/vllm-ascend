@@ -24,6 +24,29 @@ def test_multi_group_proposer_directly_inherits_ascend_eagle():
     )
 
 
+def test_lwd_composite_proposer_keeps_both_parent_axes():
+    from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import (
+        LwdMTPProposer,
+        LwdMultiKVCacheGroupMTPProposer,
+    )
+
+    assert LwdMultiKVCacheGroupMTPProposer.__bases__ == (
+        LwdMTPProposer,
+        AscendMultiKVCacheGroupMTPProposer,
+    )
+    # Embedding axis: the LWD first-pass embeds adapter stays first in the MRO.
+    assert LwdMultiKVCacheGroupMTPProposer._lwd_build_first_pass_embeds is LwdMTPProposer._lwd_build_first_pass_embeds
+    # Attention-group axis: the multi-group hooks survive the composition.
+    assert (
+        LwdMultiKVCacheGroupMTPProposer.initialize_attn_backend
+        is AscendMultiKVCacheGroupMTPProposer.initialize_attn_backend
+    )
+    assert (
+        LwdMultiKVCacheGroupMTPProposer.build_draft_attn_metadata
+        is AscendMultiKVCacheGroupMTPProposer.build_draft_attn_metadata
+    )
+
+
 def test_draft_step_update_matches_parent_signature():
     assert inspect.signature(AscendMultiKVCacheGroupMTPProposer.attn_update_stack_num_spec_norm) == inspect.signature(
         AscendEagleProposer.attn_update_stack_num_spec_norm

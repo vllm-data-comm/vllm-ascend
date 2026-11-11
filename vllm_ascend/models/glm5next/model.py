@@ -63,6 +63,8 @@ from vllm.model_executor.models.utils import (
     WeightsMapper,
     init_vllm_registered_model,
     is_pp_missing_parameter,
+    lwd_role,
+    lwd_skips_module,
     make_layers,
     maybe_prefix,
     sequence_parallel_chunk,
@@ -569,12 +571,17 @@ class Glm5NextModel(nn.Module):
             # Sparse MLA tiles top-k in 128 columns; padded slots remain masked.
             sparse_topk_block_n = 128
             buffer_width = ((buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n) * sparse_topk_block_n
-            topk_indices_buffer = torch.empty(
-                vllm_config.scheduler_config.max_num_batched_tokens,
-                buffer_width,
-                dtype=torch.int32,
-                device=self.device,
-            )
+            if lwd_role() == "edge":
+                # The edge owns no decoder layers (make_layers LWD branch),
+                # so the sparse-indexer top-k buffer would never be read.
+                topk_indices_buffer = None
+            else:
+                topk_indices_buffer = torch.empty(
+                    vllm_config.scheduler_config.max_num_batched_tokens,
+                    buffer_width,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
         else:
             # Full-MLA config (no kpool sparse indexer): no topk buffer.
             topk_indices_buffer = None
@@ -607,7 +614,7 @@ class Glm5NextModel(nn.Module):
         # doesn't rebuild the slice (a fresh list) every step.
         self._active_layers = self.layers[self.start_layer : self.end_layer]
 
-        if get_pp_group().is_last_rank:
+        if get_pp_group().is_last_rank and not lwd_skips_module("model.norm", lwd_role()):
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
@@ -984,23 +991,26 @@ class Glm5NextForConditionalGeneration(Glm4vForConditionalGeneration, HasInnerSt
         self.is_multimodal_pruning_enabled = multimodal_config.is_multimodal_pruning_enabled()
 
         with self._mark_tower_model(vllm_config, {"image", "video"}):
-            self.visual = Glm5NextVisionTransformer(
-                config.text_config,
-                config.vision_config,
-                # Read eps from the VISION sub-config, not the top-level
-                # `config.rms_norm_eps`: Glm5NextConfig.__getattribute__ mirrors
-                # the latter onto text_config (1e-5), silently ignoring the
-                # vision tower's own (1e-6) rms_norm_eps.
-                norm_eps=config.vision_config.rms_norm_eps,
-                # Vision tower ships BF16 weights in this fp8 checkpoint (no
-                # weight_scale_inv for visual.*), so it must NOT inherit the
-                # global fp8 quant_config -- doing so incorrectly quantizes
-                # the tower
-                # and yields NaN image features. Mirrors the MLA/KDA proj
-                # pattern (quant_config=None for BF16 submodules).
-                quant_config=None,
-                prefix=maybe_prefix(prefix, "visual"),
-            )
+            if lwd_skips_module("visual", lwd_role()):
+                self.visual = PPMissingLayer()
+            else:
+                self.visual = Glm5NextVisionTransformer(
+                    config.text_config,
+                    config.vision_config,
+                    # Read eps from the VISION sub-config, not the top-level
+                    # `config.rms_norm_eps`: Glm5NextConfig.__getattribute__
+                    # mirrors the latter onto text_config (1e-5), silently
+                    # ignoring the vision tower's own (1e-6) rms_norm_eps.
+                    norm_eps=config.vision_config.rms_norm_eps,
+                    # Vision tower ships BF16 weights in this fp8 checkpoint
+                    # (no weight_scale_inv for visual.*), so it must NOT
+                    # inherit the global fp8 quant_config -- doing so
+                    # incorrectly quantizes the tower
+                    # and yields NaN image features. Mirrors the MLA/KDA proj
+                    # pattern (quant_config=None for BF16 submodules).
+                    quant_config=None,
+                    prefix=maybe_prefix(prefix, "visual"),
+                )
 
         with self._mark_language_model(vllm_config):
             self.language_model = init_vllm_registered_model(
