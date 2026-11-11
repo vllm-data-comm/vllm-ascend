@@ -22,6 +22,8 @@
 - **UP host staging 单路径**: 云 endpoint comm thread 从 hint 预投 UP receive, `lwd_transfer_queue.py` 以 recv/staged events 排序分段 D2H; `lwd_host_stage.py` 持有每请求全 prompt pinned buffer 到请求结束 (无容量 cap), `lwd_cloud_model_runner.py` 按 arrival 窗口经独立 stream H2D 并推进 consumed. 云侧 preemption 最小重算保留 W1, runner 在 native `_update_states` 前按新 computed rewind host consumed 或对 self-hit 前跳, visible-set 将 preempted 置 waiting 队头. 全 prompt M-RoPE 走 RequestNotify, DSV4 embeddings+expert tail 同 buffer 布局, abort/tombstone 只屏蔽该请求的 D2H/arrival、保持 seqno 几何; 默认 pending/inflight/slots 为 10/8/8. 设计见 vllm 仓 `docs/design/lwd_host_staging.md`.
 - **Prefix caching/refill**: nonce/READY 协商 H, pinned frozen reservation fail-closed; 重准入 H′ 经 arrival/块对齐后对比 staging floor S, H′<S 时按预算切 refill、dispatch 时公告并以 nonce 上报 refill_done, self-hit 前跳. hash/cache 仅覆盖 prompt; MM 仅处理 chunk 相交 feature, prefix MTP guard 拒绝 continued prefill 的 token-id fallback 并要求权威 embeddings. LWD lookup 的 `shared_prefix_boundary=0`; native Mamba fine-grained junction 机制默认关闭. 详见 vllm 仓 `docs/design/lwd_host_staging.md`.
 
+- **MRV2 适配（实现候选）**: 新增代码的公共部分位于 vllm 仓 `vllm/v1/worker/gpu/lwd/`；本仓仅在 `worker/lwd_cloud_model/v2/` 实现 HCCL/hash-tail、Hash-MoE forward context、lmhead TP 与 Ascend runner/state/MTP 薄适配。`LwdCloudWorker` 按既有 runner 开关选择 V1/V2，旧 prompt provider 仅 V1 注册；历史 V1 runner 保持原位，不上移或改写。910B/C 真机 ST 与 RFC 尚未完成，不能视为已支持 MRV2。设计见 vllm 仓 `docs/design/lwd_model_runner_v2.md`。
+
 > [!CAUTION]
 > **团队规范区**: 下方由 `TEAM STANDARDS (BEGIN)` 与 `TEAM STANDARDS (END)` 标记圈出的区域是团队规范原文, 仅由 committer 通过评审维护.
 > 在日常编码/文档任务中, **严禁修改区内任何内容**, 包括格式化、重排、翻译、增删条目.
