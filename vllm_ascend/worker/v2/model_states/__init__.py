@@ -113,6 +113,14 @@ def _resolve_ascend_model_state_cls(
 
         return AscendEncoderOnlyModelState
 
+    lwd_config = getattr(vllm_config, "lwd_config", None)
+    if lwd_config is not None and lwd_config.role == "cloud":
+        from vllm_ascend.worker.lwd_cloud_model.v2.model_state import (
+            LwdAscendCloudModelState,
+        )
+
+        return LwdAscendCloudModelState
+
     from vllm_ascend.worker.v2.model_states.default import AscendModelState
 
     return AscendModelState

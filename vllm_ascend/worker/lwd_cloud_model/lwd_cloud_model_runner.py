@@ -74,6 +74,8 @@ class LwdDownSelection(NamedTuple):
 class LwdCloudModelRunner(LwdBaseModelRunner):
     """NPUModelRunner + LWD cloud-side runner logic."""
 
+    runner_kind = "v1"
+
     # Config-derived constants, computed once at first use; lwd_config and
     # the HF config are immutable at runtime. Class-level defaults keep
     # instances built via __new__ (tests) from tripping on missing attrs.

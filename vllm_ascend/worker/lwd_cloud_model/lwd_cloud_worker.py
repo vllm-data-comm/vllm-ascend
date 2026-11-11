@@ -63,13 +63,18 @@ class LwdCloudWorker(LwdWorkerBase):
     process; the data-plane wiring below runs unconditionally."""
 
     def init_device(self) -> None:
+        self.model_config.enable_prompt_embeds = True
         super().init_device()
         self._lwd_down_next_seqno = 0
         self._init_lwd_early_recv_state()
         if self.use_v2_model_runner:
-            raise RuntimeError("LWD data plane requires the V1 model runner; use_v2_model_runner is not supported")
-        self.model_config.enable_prompt_embeds = True
-        self.model_runner = LwdCloudModelRunner(self.vllm_config, self.device, worker=self)
+            from vllm_ascend.worker.lwd_cloud_model.v2.model_runner import (
+                LwdAscendCloudModelRunnerV2,
+            )
+
+            self.model_runner = LwdAscendCloudModelRunnerV2(self.vllm_config, self.device, worker=self)
+        else:
+            self.model_runner = LwdCloudModelRunner(self.vllm_config, self.device, worker=self)
         self._init_lwd_data_plane()
         import torch.distributed as dist
 
@@ -93,7 +98,8 @@ class LwdCloudWorker(LwdWorkerBase):
             self._lwd_early_recv_endpoint,
             self._lwd_up_hidden_size,
         )
-        self._register_lwd_prompt_embeds_provider()
+        if not self.use_v2_model_runner:
+            self._register_lwd_prompt_embeds_provider()
 
     def _lwd_init_lwd_host_stager(self) -> None:
         """Create endpoint host staging with fixed limits."""
@@ -444,7 +450,7 @@ class LwdCloudWorker(LwdWorkerBase):
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput:
         _t0 = time.monotonic()
-        output = self.model_runner.sample_tokens(grammar_output)
+        output = super().sample_tokens(grammar_output)
         _t_sample = time.monotonic()
         # rank-replay DOWN: send the hidden packet (channel-async,
         # in-stream ordered). The executor output thread harvests the device

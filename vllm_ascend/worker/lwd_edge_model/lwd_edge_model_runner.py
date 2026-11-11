@@ -51,6 +51,8 @@ def select_token_batch(logits: torch.Tensor, ranks: list[int]) -> list[int]:
 class LwdEdgeModelRunner(LwdBaseModelRunner):
     """Embed + unembed compute for the LWD edge (no native step pipeline)."""
 
+    runner_kind = "v1"
+
     def __init__(
         self,
         vllm_config: VllmConfig,

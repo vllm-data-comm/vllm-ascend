@@ -1143,8 +1143,11 @@ class NPUModelRunner(GPUModelRunner):
             capacity,
             "max_num_reqs * decode_query_len",
         )
-        logits = self.model.compute_logits(hidden_states[sample_indices])
+        logits = self.model_state.compute_sample_logits(hidden_states[sample_indices])
         logits = logits[:num_logits]
+        capture_logits = getattr(self.model_state, "capture_lwd_sample_logits", None)
+        if capture_logits is not None:
+            capture_logits(logits)
 
         # Dispatch tail mirrors GPUModelRunner.sample; refresh it on main bumps.
         invalid_drafts = None

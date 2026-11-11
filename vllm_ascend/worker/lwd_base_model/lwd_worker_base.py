@@ -49,6 +49,9 @@ class LwdWorkerBase(NPUWorker):
             custom_factor=scramble.custom_factor,
         )
 
+    def lwd_model_runner_kind(self) -> str:
+        return self.model_runner.runner_kind
+
     def _init_lwd_data_plane(self) -> None:
         # The data-plane channels MUST be built here, never in ``__init__``.
         # ``lwd_init_channels`` creates the HCCL process groups of every DP
