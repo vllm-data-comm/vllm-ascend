@@ -90,6 +90,13 @@ def init_speculator(
 
         return AscendGemma4Speculator(vllm_config, device)
     if speculative_config.method == "mtp" and not speculative_config.use_step3p5_mtp():
+        lwd_config = getattr(vllm_config, "lwd_config", None)
+        if lwd_config is not None and lwd_config.role == "cloud":
+            from vllm_ascend.worker.lwd_cloud_model.v2.mtp_speculator import (
+                LwdAscendCloudMTPSpeculator,
+            )
+
+            return LwdAscendCloudMTPSpeculator(vllm_config, device)
         from vllm_ascend.worker.v2.spec_decode.mtp.speculator import (
             AscendMTPSpeculator,
         )
