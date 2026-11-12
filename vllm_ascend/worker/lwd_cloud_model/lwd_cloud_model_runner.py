@@ -55,6 +55,9 @@ if TYPE_CHECKING:
     from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import LwdHostStager
 
 
+_LWD_H2D_VERIFY_ELEMENTS = 16
+
+
 class LwdPromptWindow(NamedTuple):
     """One request's prompt rows in the current native scheduling window."""
 
@@ -835,13 +838,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         requests after startup, only on non-group-leader endpoint ranks,
         self-heals afterwards, no error anywhere.
 
-        The check sums the first 16 destination elements: real embedding rows
-        are never all-zero (first row measured 0.12/-0.03/...), so legitimate
-        input cannot trip it. ``strict=False`` is for the expert-ID tail
-        (bytes may legitimately be zero): retry only, never fail; the retry
-        is idempotent. In steady state D2H finished long ago, the first read
-        passes and the retry branch never fires; the standing cost is one
-        blocking copy plus one 16-element read-back on the H2D stream.
+        The check compares the first 16 destination elements with the same
+        source elements, including matching NaNs. All-zero and zero-sum data
+        therefore pass. ``strict=False`` is for the expert-ID tail: retry a
+        mismatch once, but never fail; the retry is idempotent. The standing
+        cost is one blocking copy plus a bounded sample comparison on the H2D
+        stream.
 
         Sync scope: the read-back only needs the *issuing* stream drained,
         which the blocking ``copy_`` already guarantees, so a stream-level
@@ -855,20 +857,42 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         """
         dst.copy_(src, non_blocking=False)
         torch.npu.current_stream().synchronize()
-        if float(dst[:16].float().sum().item()) != 0.0:
+        dst_sample = dst[:_LWD_H2D_VERIFY_ELEMENTS]
+        src_sample = src[:_LWD_H2D_VERIFY_ELEMENTS]
+
+        def samples_match() -> bool:
+            try:
+                if torch.equal(dst_sample, src_sample):
+                    return True
+            except RuntimeError:
+                # Some backends require both operands on the same device.
+                pass
+            dst_cpu = dst_sample.cpu()
+            src_cpu = src_sample.cpu()
+            if torch.equal(dst_cpu, src_cpu):
+                return True
+            if dst_cpu.is_floating_point() or dst_cpu.is_complex():
+                return bool(
+                    torch.all(
+                        (dst_cpu == src_cpu)
+                        | (torch.isnan(dst_cpu) & torch.isnan(src_cpu))
+                    ).item()
+                )
+            return False
+
+        if samples_match():
             return
         lwd_logger.warning(
-            "[Lwd][cloud-runner] H2D first-copy lost req=%s "
-            "(dst head zero after sync copy; retrying)",
+            "[LWD][cloud-runner] H2D first-copy mismatch req=%s "
+            "(sample differs after sync copy; retrying)",
             rid,
         )
         dst.copy_(src, non_blocking=False)
         torch.npu.current_stream().synchronize()
-        if strict and float(dst[:16].float().sum().item()) == 0.0:
+        if strict and not samples_match():
             raise RuntimeError(
-                f"[Lwd][cloud-runner] H2D copy lost twice req={rid} "
-                f"(src_sum={float(src[:16].float().sum())}, dst stays "
-                f"zero after retry)"
+                f"[LWD][cloud-runner] H2D copy mismatch twice req={rid} "
+                "(source and destination samples differ after retry)"
             )
 
     def _lwd_h2d_stream(self) -> torch.npu.Stream:
