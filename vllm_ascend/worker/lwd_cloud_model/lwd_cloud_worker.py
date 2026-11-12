@@ -19,7 +19,10 @@ import time
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tp_group,
+)
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
 
@@ -32,6 +35,7 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
     ConnectionId,
     LwdChannelType,
     LwdTransferRequest,
+    connection_from,
 )
 from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
@@ -212,8 +216,6 @@ class LwdCloudWorker(LwdWorkerBase):
         meta = batch.batch_meta
         if meta is None or self._lwd_stager is None:
             return
-        from vllm_ascend.distributed.lwd_data_plane.lwd_types import connection_from
-
         if connection_from(meta) not in self._lwd_early_recv_connections:
             return
         for req_id in meta.aborted_req_ids or ():
@@ -656,8 +658,6 @@ class LwdCloudWorker(LwdWorkerBase):
         # this worker thread free to prepare and execute subsequent steps.
         payloads = self.model_runner.take_lwd_pending_down_payload()
         if payloads:
-            from vllm.distributed.parallel_state import get_tp_group
-
             is_driver = get_tp_group().is_first_rank
             carriers = []
             legacy_carrier = None

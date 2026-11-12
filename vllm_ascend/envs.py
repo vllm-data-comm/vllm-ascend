@@ -35,6 +35,24 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+LWD_RECV_HINT_MQ_ENV = "VLLM_ASCEND_LWD_RECV_HINT_HANDLE"
+
+
+def lwd_recv_hint_mq_env(connection: Any) -> str:
+    """Return the fixed per-connection hint-handle environment key.
+
+    Handles must be exported before workers are spawned or forked; later
+    parent-process updates are not visible to existing children. Keep the
+    legacy unqualified key for the default connection.
+    """
+    if (connection.edge_id, connection.cloud_id, connection.dp_idx) == (0, 0, 0):
+        return LWD_RECV_HINT_MQ_ENV
+    return (
+        f"{LWD_RECV_HINT_MQ_ENV}_E{connection.edge_id}"
+        f"C{connection.cloud_id}D{connection.dp_idx}"
+    )
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which
@@ -82,7 +100,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Emit per-layer KVPool ranged transfer audit events. Default: 0 (disabled).
     # Valid values: 0 or 1. This configuration is not sensitive.
     "VLLM_ASCEND_KVPOOL_RANGE_DEBUG": lambda: _strict_binary_env("VLLM_ASCEND_KVPOOL_RANGE_DEBUG"),
+    # LWD early-receive hint MQ handle for the default connection. Additional
+    # connections use lwd_recv_hint_mq_env(); their dynamic keys cannot be
+    # enumerated here without breaking worker-side handle discovery.
+    # Default: None. Values are base64-encoded handles and are not sensitive.
+    "VLLM_ASCEND_LWD_RECV_HINT_HANDLE": lambda: os.getenv(LWD_RECV_HINT_MQ_ENV),
     # LWD endpoint echo handshake timeout in seconds. Default: 30; must be positive.
+    # This configuration is not sensitive.
     "VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S": lambda: float(
         os.getenv("VLLM_ASCEND_LWD_HCCL_HANDSHAKE_TIMEOUT_S", "30")
     ),

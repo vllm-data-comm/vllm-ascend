@@ -27,15 +27,16 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from vllm_ascend import envs
 from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdChannelType
 
 if TYPE_CHECKING:
     from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 
-#: Env var carrying the downstream hint MQ handle. The executor exports it
-#: before creating the worker; the worker rebuilds the reader in
-#: ``init_device`` — both sides honor this single constant name.
-LWD_RECV_HINT_MQ_ENV = "VLLM_ASCEND_LWD_RECV_HINT_HANDLE"
+#: Legacy name retained for callers of the default connection. All key
+#: generation is centralized in envs because non-default connections use
+#: deterministic dynamic keys that cannot be listed in ``env_variables``.
+LWD_RECV_HINT_MQ_ENV = envs.LWD_RECV_HINT_MQ_ENV
 
 _SIDEBAND_MAX_CHUNK_BYTES = 4096
 _SIDEBAND_MAX_CHUNKS = 64
@@ -176,9 +177,7 @@ def _decode_handle(raw: str) -> Handle:
 
 
 def _hint_env_key(connection: ConnectionId) -> str:
-    if connection == ConnectionId(0, 0, 0):
-        return LWD_RECV_HINT_MQ_ENV
-    return f"{LWD_RECV_HINT_MQ_ENV}_E{connection.edge_id}C{connection.cloud_id}D{connection.dp_idx}"
+    return envs.lwd_recv_hint_mq_env(connection)
 
 
 def create_hint_mq(connection_id: ConnectionId) -> MessageQueue:
@@ -222,6 +221,8 @@ _hint_senders: dict[ConnectionId, Callable[[dict[str, Any]], None]] = {}
 _watermarks: dict[tuple[ConnectionId, LwdChannelType], int] = {}
 _lock = threading.Lock()
 
+LwdIrecvCompletion = tuple[ConnectionId, LwdChannelType, int]
+
 
 def register_hint_sender(
     sender: Callable[[dict[str, Any]], None],
@@ -252,10 +253,10 @@ def post_irecv_hint(hint: dict[str, Any]) -> None:
 
 
 def record_irecv_completions(
-    items: Iterable[tuple],
-) -> list[tuple]:
+    items: Iterable[LwdIrecvCompletion],
+) -> list[LwdIrecvCompletion]:
     """Merge completions into independent per-connection watermarks."""
-    advanced: list[tuple] = []
+    advanced: list[LwdIrecvCompletion] = []
     with _lock:
         for item in items:
             connection, channel, seqno = item

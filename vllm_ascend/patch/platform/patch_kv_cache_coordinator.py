@@ -148,7 +148,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         scheduler_block_size: int | None = None,
         num_prefill_lookahead: int = 0,
         allow_partial_hash_hits: bool = True,
-    ):
+    ) -> None:
         # Keep pcp_world_size in this patched constructor for compatibility
         # with the upstream coordinator interface. PCP is rejected by the platform.
         del pcp_world_size
@@ -278,7 +278,7 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
             if unsupported_partial_hit_managers:
                 self.enable_partial_hash_hits = False
                 logger.warning_once(
-                    "Disabling fine-grained prefix-cache hits because these KV "
+                    "[LWD] Disabling fine-grained prefix-cache hits because these KV "
                     "cache managers cannot serve %d-token-aligned probes: %s.",
                     hit_alignment,
                     ", ".join(sorted(unsupported_partial_hit_managers)),

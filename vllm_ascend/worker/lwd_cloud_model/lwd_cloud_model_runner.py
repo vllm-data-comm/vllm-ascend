@@ -18,7 +18,8 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
-from vllm.distributed.parallel_state import get_pp_group
+import torch.distributed as dist
+from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.lwd_logger import lwd_logger
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
@@ -56,6 +57,7 @@ if TYPE_CHECKING:
 
 
 _LWD_H2D_VERIFY_ELEMENTS = 16
+_LWD_WINDOW_MIN_DEPTH = 2
 
 
 class LwdPromptWindow(NamedTuple):
@@ -703,9 +705,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         num_hash_layers, top_k = self._lwd_hash_dims()
         tail_per_row = 4 * num_hash_layers * top_k
         windows: list[LwdUpWindow] = []
-        import torch.distributed as dist
-        from vllm.distributed.parallel_state import get_tp_group
-
         tp = get_tp_group()
         for connection in sorted(grouped):
             connection_plan = grouped[connection]
@@ -903,10 +902,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             self._lwd_h2d_copy_stream = stream
         return stream
 
-    def _lwd_window_device(self, numel: int, min_depth: int = 2) -> tuple[torch.Tensor, int]:
+    def _lwd_window_device(
+        self, numel: int, min_depth: int = _LWD_WINDOW_MIN_DEPTH
+    ) -> tuple[torch.Tensor, int]:
         """Return a rotating device window protected by a prior-use event."""
         buffers = getattr(self, "_lwd_win_dev", None)
-        depth = max(2, min_depth)
+        depth = max(_LWD_WINDOW_MIN_DEPTH, min_depth)
         if buffers is not None and buffers[0].numel() >= numel:
             while len(buffers) < depth:
                 buffers.append(torch.empty(buffers[0].numel(), dtype=torch.bfloat16, device=self.device))
