@@ -114,6 +114,7 @@ def load_worker_methods():
 
 Worker, worker_globals = load_worker_methods()
 DEFAULT_CONNECTION = lwd_types.ConnectionId(0, 0, 0)
+OTHER_CONNECTION = lwd_types.ConnectionId(1, 0, 0)
 
 
 class FakeBuffer:
@@ -162,17 +163,20 @@ class FakeDataPlane:
         self.requests: list[object] = []
         self.futures: list[FakeFuture] = []
         self.error: RuntimeError | None = None
+        self.errors: dict[object, RuntimeError] = {}
+        self.aborted_connections: list[object] = []
 
     def submit_recv(self, request: object) -> FakeFuture:
-        if self.error is not None:
-            raise self.error
+        error = self.errors.get(lwd_types.connection_from(request), self.error)
+        if error is not None:
+            raise error
         future = FakeFuture()
         self.requests.append(request)
         self.futures.append(future)
         return future
 
     def abort_connection(self, connection: object, error: RuntimeError) -> None:
-        pass
+        self.aborted_connections.append(connection)
 
 
 class FakeDoneMq:
@@ -199,12 +203,13 @@ def make_hint(
     prompt_lens: list[int],
     refills: list[bool] | None = None,
     prefix_nonces: list[int] | None = None,
+    connection: lwd_types.ConnectionId = DEFAULT_CONNECTION,
 ) -> dict:
     return pre_recv.make_recv_hint(
         seqno,
         sum(rows),
         0,
-        connection_id=DEFAULT_CONNECTION,
+        connection_id=connection,
         req_ids=req_ids,
         rows=rows,
         prompt_offsets=offsets,
@@ -214,8 +219,12 @@ def make_hint(
     )
 
 
-def start_early_irecv(worker, hint: dict) -> None:
-    Worker.start_early_irecv(worker, hint, connection_id=DEFAULT_CONNECTION)
+def start_early_irecv(
+    worker,
+    hint: dict,
+    connection: lwd_types.ConnectionId = DEFAULT_CONNECTION,
+) -> None:
+    Worker.start_early_irecv(worker, hint, connection_id=connection)
 
 
 @pytest.fixture
@@ -264,6 +273,13 @@ def worker(monkeypatch: pytest.MonkeyPatch):
     instance._data_plane = data_plane
     instance.model_runner = NS(lwd_release_finished=lambda req_ids: None)
     return instance
+
+
+@pytest.fixture
+def two_connection_worker(worker):
+    worker._lwd_early_recv_connections = (DEFAULT_CONNECTION, OTHER_CONNECTION)
+    worker._irecv_done_mqs[OTHER_CONNECTION] = FakeDoneMq()
+    return worker
 
 
 def test_host_stager_init_uses_scheduler_token_capacity(worker) -> None:
@@ -487,3 +503,201 @@ def test_finish_before_publish_drains_descriptor_but_reports_watermark(worker) -
     assert worker._lwd_stager.host_bytes == 0
     assert worker._lwd_stager.staged_count == 0
     assert worker._early_recv_last_delivered[DEFAULT_CONNECTION] == 0
+
+
+def test_two_connections_have_independent_lifecycles(two_connection_worker) -> None:
+    worker = two_connection_worker
+    for connection, req_id in ((DEFAULT_CONNECTION, "a"), (OTHER_CONNECTION, "b")):
+        start_early_irecv(
+            worker,
+            make_hint(0, [req_id], [2], [0], [4], connection=connection),
+            connection,
+        )
+    for connection, req_id in ((DEFAULT_CONNECTION, "a"), (OTHER_CONNECTION, "b")):
+        start_early_irecv(
+            worker,
+            make_hint(1, [req_id], [2], [2], [4], connection=connection),
+            connection,
+        )
+
+    assert len(worker._early_recv_futures) == 2
+    assert len(worker._early_recv_pending) == 2
+    worker._report_irecv_completions()
+
+    for connection, req_id in ((DEFAULT_CONNECTION, "a"), (OTHER_CONNECTION, "b")):
+        assert worker._irecv_done_mqs[connection].items == [
+            ((connection, lwd_types.LwdChannelType.UP, 0), [(req_id, 2)])
+        ]
+        worker._lwd_up_post_recvs(
+            NS(
+                lwd_batch=NS(
+                    batch_type=FakeBatchType.LWD_EMBED,
+                    batch_meta=NS(connection_id=connection, aborted_req_ids=[req_id]),
+                )
+            )
+        )
+
+    worker._report_irecv_completions()
+    for connection, req_id in ((DEFAULT_CONNECTION, "a"), (OTHER_CONNECTION, "b")):
+        assert worker._irecv_done_mqs[connection].items == [
+            ((connection, lwd_types.LwdChannelType.UP, 0), [(req_id, 2)]),
+            ((connection, lwd_types.LwdChannelType.UP, 1), []),
+        ]
+        assert worker._early_recv_last_delivered[connection] == 1
+    assert not worker._early_recv_futures
+    assert not worker._early_recv_pending
+
+
+@pytest.mark.parametrize("failure_kind", ["submit", "future", "staged_event"])
+def test_connection_failure_does_not_stop_other(two_connection_worker, failure_kind: str) -> None:
+    worker = two_connection_worker
+    error = RuntimeError(f"{failure_kind} failed")
+    if failure_kind == "submit":
+        worker._data_plane.errors[DEFAULT_CONNECTION] = error
+
+    start_early_irecv(worker, make_hint(0, ["a"], [2], [0], [4]))
+    start_early_irecv(
+        worker,
+        make_hint(0, ["b"], [2], [0], [4], connection=OTHER_CONNECTION),
+        OTHER_CONNECTION,
+    )
+    if failure_kind != "submit":
+        future = worker._data_plane.futures[0]
+        if failure_kind == "future":
+            future.error = error
+        else:
+            future.staged_error = error
+
+    worker._report_irecv_completions()
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [
+        (DEFAULT_CONNECTION, "error", 0, repr(error))
+    ]
+    assert worker._irecv_done_mqs[OTHER_CONNECTION].items == [
+        ((OTHER_CONNECTION, lwd_types.LwdChannelType.UP, 0), [("b", 2)])
+    ]
+    assert worker._data_plane.aborted_connections == [DEFAULT_CONNECTION]
+
+    start_early_irecv(
+        worker,
+        make_hint(1, ["b"], [2], [2], [4], connection=OTHER_CONNECTION),
+        OTHER_CONNECTION,
+    )
+    worker._report_irecv_completions()
+    assert worker._irecv_done_mqs[OTHER_CONNECTION].items[-1] == (
+        (OTHER_CONNECTION, lwd_types.LwdChannelType.UP, 1),
+        [("b", 4)],
+    )
+    assert worker._early_recv_failed_connections == {DEFAULT_CONNECTION}
+    assert worker._early_recv_last_delivered == {OTHER_CONNECTION: 1}
+
+
+def test_max_inflight_two_round_robins_connections(two_connection_worker) -> None:
+    worker = two_connection_worker
+    for connection in (DEFAULT_CONNECTION, OTHER_CONNECTION):
+        start_early_irecv(
+            worker,
+            make_hint(0, [str(connection.edge_id)], [2], [0], [4], connection=connection),
+            connection,
+        )
+    for connection in (DEFAULT_CONNECTION, OTHER_CONNECTION):
+        for seqno in (1, 2):
+            start_early_irecv(
+                worker,
+                make_hint(
+                    seqno,
+                    [str(connection.edge_id)],
+                    [1],
+                    [seqno],
+                    [4],
+                    connection=connection,
+                ),
+                connection,
+            )
+
+    assert len(worker._early_recv_futures) == 2
+    assert len(worker._early_recv_pending) == 4
+    worker._report_irecv_completions()
+    submitted = [
+        (lwd_types.connection_from(request), request.seqno)
+        for request in worker._data_plane.requests
+    ]
+    assert submitted == [
+        (DEFAULT_CONNECTION, 0),
+        (OTHER_CONNECTION, 0),
+        (DEFAULT_CONNECTION, 1),
+        (OTHER_CONNECTION, 1),
+    ]
+
+    worker._report_irecv_completions()
+    submitted = [
+        (lwd_types.connection_from(request), request.seqno)
+        for request in worker._data_plane.requests
+    ]
+    assert submitted[4:] == [(DEFAULT_CONNECTION, 2), (OTHER_CONNECTION, 2)]
+    assert len(worker._early_recv_futures) == 2
+    assert not worker._early_recv_pending
+
+
+def test_idle_connection_capacity_is_reused(two_connection_worker) -> None:
+    worker = two_connection_worker
+    for seqno in (0, 1):
+        start_early_irecv(
+            worker,
+            make_hint(seqno, ["a"], [1], [seqno], [4]),
+        )
+
+    assert [
+        (lwd_types.connection_from(request), request.seqno)
+        for request in worker._data_plane.requests
+    ] == [(DEFAULT_CONNECTION, 0), (DEFAULT_CONNECTION, 1)]
+    assert len(worker._early_recv_futures) == 2
+    assert not worker._early_recv_pending
+
+
+def test_watermark_gap_isolated_and_recovers_without_starvation(
+    two_connection_worker,
+) -> None:
+    worker = two_connection_worker
+    start_early_irecv(worker, make_hint(0, ["a"], [2], [0], [4]))
+    start_early_irecv(
+        worker,
+        make_hint(0, ["b"], [2], [0], [4], connection=OTHER_CONNECTION),
+        OTHER_CONNECTION,
+    )
+    blocked_future = worker._data_plane.futures[0]
+    blocked_future.is_done = False
+    for connection, req_id in ((DEFAULT_CONNECTION, "a"), (OTHER_CONNECTION, "b")):
+        start_early_irecv(
+            worker,
+            make_hint(1, [req_id], [2], [2], [4], connection=connection),
+            connection,
+        )
+
+    worker._report_irecv_completions()
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == []
+    assert worker._irecv_done_mqs[OTHER_CONNECTION].items == [
+        ((OTHER_CONNECTION, lwd_types.LwdChannelType.UP, 0), [("b", 2)])
+    ]
+    assert (OTHER_CONNECTION, lwd_types.LwdChannelType.UP, 1) in worker._early_recv_futures
+
+    worker._report_irecv_completions()
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == []
+    assert worker._irecv_done_mqs[OTHER_CONNECTION].items[-1] == (
+        (OTHER_CONNECTION, lwd_types.LwdChannelType.UP, 1),
+        [("b", 4)],
+    )
+    assert (DEFAULT_CONNECTION, lwd_types.LwdChannelType.UP, 1) in worker._early_recv_futures
+    assert DEFAULT_CONNECTION not in worker._early_recv_last_delivered
+
+    blocked_future.is_done = True
+    worker._report_irecv_completions()
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [
+        ((DEFAULT_CONNECTION, lwd_types.LwdChannelType.UP, 0), [("a", 2)]),
+        ((DEFAULT_CONNECTION, lwd_types.LwdChannelType.UP, 1), [("a", 4)]),
+    ]
+    assert worker._early_recv_last_delivered == {
+        DEFAULT_CONNECTION: 1,
+        OTHER_CONNECTION: 1,
+    }
+    assert not worker._early_recv_futures
+    assert not worker._early_recv_pending
