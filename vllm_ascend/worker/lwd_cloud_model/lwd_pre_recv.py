@@ -33,11 +33,6 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdCh
 if TYPE_CHECKING:
     from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue
 
-#: Legacy name retained for callers of the default connection. All key
-#: generation is centralized in envs because non-default connections use
-#: deterministic dynamic keys that cannot be listed in ``env_variables``.
-LWD_RECV_HINT_MQ_ENV = envs.LWD_RECV_HINT_MQ_ENV
-
 _SIDEBAND_MAX_CHUNK_BYTES = 4096
 _SIDEBAND_MAX_CHUNKS = 64
 
@@ -264,22 +259,3 @@ def record_irecv_completions(
                 _watermarks[key] = seqno
                 advanced.append(item)
     return advanced
-
-
-def watermark(
-    channel: LwdChannelType,
-    connection_id: ConnectionId | None = None,
-) -> int:
-    """Current watermark on one connection (-1 = none yet)."""
-    connection = connection_id or ConnectionId(0, 0, 0)
-    with _lock:
-        return _watermarks.get((connection, channel), -1)
-
-
-def is_irecv_complete(
-    channel: LwdChannelType,
-    seqno: int,
-    connection_id: ConnectionId | None = None,
-) -> bool:
-    """Whether one connection's receive has completed."""
-    return seqno <= watermark(channel, connection_id)

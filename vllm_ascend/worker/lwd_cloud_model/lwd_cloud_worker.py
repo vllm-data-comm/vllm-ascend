@@ -768,11 +768,7 @@ class LwdCloudWorker(LwdWorkerBase):
 
         AscendSpecDecodeBaseProposer.set_lwd_prompt_embeds_provider(_lwd_prompt_embeds_provider)
 
-    def _lwd_next_down_seqno(self, connection: ConnectionId | int | None = None) -> int:
-        if connection is None:
-            connection = ConnectionId(0, 0, 0)
-        elif isinstance(connection, int):
-            connection = ConnectionId(0, 0, connection)
+    def _lwd_next_down_seqno(self, connection: ConnectionId) -> int:
         seqno = self._lwd_down_next_seqno.get(connection, 0)
         self._lwd_down_next_seqno[connection] = seqno + 1
         return seqno
