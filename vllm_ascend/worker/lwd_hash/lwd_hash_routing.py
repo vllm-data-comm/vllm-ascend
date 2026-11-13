@@ -1,12 +1,21 @@
 # Copyright (c) 2026 Huawei Technologies Co., Ltd. All Rights Reserved.
 """Lossless LWD expert-ID transport and request-position bookkeeping."""
 
+from typing import TYPE_CHECKING
+
 import torch
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from transformers import PretrainedConfig
 
 
 def hash_layer_count(config: "PretrainedConfig") -> int:
     """Return the Hash MoE layer count for DeepSeek V4; zero for other models."""
-    return config.num_hash_layers if getattr(config, "model_type", None) == "deepseek_v4" else 0
+    if getattr(config, "model_type", None) != "deepseek_v4":
+        return 0
+    return config.mlp_layer_types.count("hash_moe")
 
 
 def hash_payload_numel(num_tokens: int, hidden_size: int, num_layers: int, top_k: int) -> int:
@@ -74,9 +83,7 @@ class LwdHashRoutingState:
         """Release a request's expert IDs and validity mask; a missing request is a no-op."""
         self.requests.pop(req_id, None)
 
-    def add_chunk(
-        self, req_id: str, prompt_len: int, start: int, expert_ids: torch.Tensor
-    ) -> None:
+    def add_chunk(self, req_id: str, prompt_len: int, start: int, expert_ids: torch.Tensor) -> None:
         """Validate a remote expert-ID chunk, write it into the request's absolute prompt position and mark it valid."""
         ids = expert_ids.to(device="cpu", dtype=torch.int32)
         if ids.ndim != 3 or tuple(ids.shape[1:]) != (self.num_layers, self.top_k):
@@ -103,7 +110,10 @@ class LwdHashRoutingState:
         computed: "Sequence[int]",
         prompt_lengths: "Sequence[int]",
     ) -> "tuple[torch.Tensor, torch.Tensor]":
-        """Assemble CPU expert IDs and the prompt mask by request order and computed positions; raise when prompt data is missing."""
+        """Assemble CPU expert IDs and the prompt mask by request order and computed positions.
+
+        Raise when prompt data is missing.
+        """
         if not len(req_ids) == len(counts) == len(computed) == len(prompt_lengths):
             raise ValueError("LWD Hash routing batch metadata lengths do not match")
         total = sum(int(n) for n in counts)

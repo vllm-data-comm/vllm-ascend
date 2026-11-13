@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm_ascend.spec_decode.eagle_proposer import AscendEagleProposer
+from vllm_ascend.worker.v1.spec_decode.eagle_proposer import AscendEagleProposer
 
 if TYPE_CHECKING:
     from vllm.v1.attention.backend import CommonAttentionMetadata
