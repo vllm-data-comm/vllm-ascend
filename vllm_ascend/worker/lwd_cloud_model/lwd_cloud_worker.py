@@ -97,9 +97,7 @@ class LwdCloudWorker(LwdWorkerBase):
         if lwd_config.topology.is_host_comm:
             # Host links terminate at TP rank 0 of this instance world.
             tp0_rank = global_rank - get_tensor_model_parallel_rank()
-            self._lwd_up_src_ranks = {
-                connection: tp0_rank for connection in self._lwd_connections
-            }
+            self._lwd_up_src_ranks = {connection: tp0_rank for connection in self._lwd_connections}
         else:
             from vllm.distributed.lwd import LwdParallelGroupsSpec
 
@@ -293,9 +291,7 @@ class LwdCloudWorker(LwdWorkerBase):
         lwd_logger.info(
             "[Lwd][pre-recv] comm thread starting rank=%d hint MQ=%s",
             self.rank,
-            "attached"
-            if any(mq is not None for mq in self._irecv_hint_mqs.values())
-            else "none",
+            "attached" if any(mq is not None for mq in self._irecv_hint_mqs.values()) else "none",
         )
         self._lwd_early_recv_thread = threading.Thread(
             target=self._lwd_early_recv_loop,
@@ -304,9 +300,7 @@ class LwdCloudWorker(LwdWorkerBase):
         )
         self._lwd_early_recv_thread.start()
 
-    def lwd_early_recv_done_handle(
-        self, connection_id: ConnectionId
-    ) -> Handle | None:
+    def lwd_early_recv_done_handle(self, connection_id: ConnectionId) -> Handle | None:
         """Handle of one connection's done MQ, for the engine reader."""
         done_mq = self._irecv_done_mqs.get(connection_id)
         if done_mq is None:
@@ -331,15 +325,9 @@ class LwdCloudWorker(LwdWorkerBase):
             "[Lwd][pre-recv] comm thread up rank=%d device=%s hint MQ=%s",
             self.rank,
             self.device,
-            "attached"
-            if any(mq is not None for mq in self._irecv_hint_mqs.values())
-            else "none",
+            "attached" if any(mq is not None for mq in self._irecv_hint_mqs.values()) else "none",
         )
-        hint_mqs = {
-            connection: mq
-            for connection, mq in self._irecv_hint_mqs.items()
-            if mq is not None
-        }
+        hint_mqs = {connection: mq for connection, mq in self._irecv_hint_mqs.items() if mq is not None}
         while not self._lwd_early_recv_stop.is_set():
             for connection, hint_mq in hint_mqs.items():
                 if connection in self._early_recv_failed_connections:
@@ -433,11 +421,7 @@ class LwdCloudWorker(LwdWorkerBase):
         from vllm_ascend.worker.lwd_cloud_model.lwd_pre_recv import hint_fields
 
         fields = hint_fields(hint)
-        if (
-            fields is None
-            or fields.connection != connection_id
-            or hint.get("channel") is not LwdChannelType.UP
-        ):
+        if fields is None or fields.connection != connection_id or hint.get("channel") is not LwdChannelType.UP:
             try:
                 seqno = int(hint.get("seqno", -1)) if isinstance(hint, dict) else -1
             except (TypeError, ValueError):
@@ -739,9 +723,7 @@ class LwdCloudWorker(LwdWorkerBase):
                 # A blocked HCCL call may outlive this worker. The data plane is
                 # permanently closed against new submissions, but its channels
                 # must remain valid until the process exits and reaps the thread.
-                lwd_logger.warning(
-                    "[Lwd][pre-recv] skip channel destruction while comm thread is alive"
-                )
+                lwd_logger.warning("[Lwd][pre-recv] skip channel destruction while comm thread is alive")
             else:
                 from vllm_ascend.distributed.lwd_data_plane.lwd_channels import (
                     lwd_destroy_channels,
@@ -786,8 +768,10 @@ class LwdCloudWorker(LwdWorkerBase):
 
         AscendSpecDecodeBaseProposer.set_lwd_prompt_embeds_provider(_lwd_prompt_embeds_provider)
 
-    def _lwd_next_down_seqno(self, connection: ConnectionId | int = ConnectionId(0, 0, 0)) -> int:
-        if isinstance(connection, int):
+    def _lwd_next_down_seqno(self, connection: ConnectionId | int | None = None) -> int:
+        if connection is None:
+            connection = ConnectionId(0, 0, 0)
+        elif isinstance(connection, int):
             connection = ConnectionId(0, 0, connection)
         seqno = self._lwd_down_next_seqno.get(connection, 0)
         self._lwd_down_next_seqno[connection] = seqno + 1

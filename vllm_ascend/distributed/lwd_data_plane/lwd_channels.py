@@ -130,7 +130,9 @@ class _ChannelProbeResult:
 
 def _lwd_probe_timeout_detail(connection: ConnectionId, channel: LwdChannelType, peer: int) -> str:
     """Format the shared TIMEOUT detail for a channel probe."""
-    return f"[connection={connection} channel={channel.value}] probe TIMEOUT after {LWD_PROBE_TIMEOUT_S:g}s (peer={peer})"
+    return (
+        f"[connection={connection} channel={channel.value}] probe TIMEOUT after {LWD_PROBE_TIMEOUT_S:g}s (peer={peer})"
+    )
 
 
 def _lwd_probe_channel(

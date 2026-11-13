@@ -360,7 +360,9 @@ def test_unstaged_completion_is_not_published(worker) -> None:
 
     future.is_staged = True
     worker._report_irecv_completions()
-    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [((DEFAULT_CONNECTION, lwd_types.LwdChannelType.UP, 0), [("a", 2)])]
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [
+        ((DEFAULT_CONNECTION, lwd_types.LwdChannelType.UP, 0), [("a", 2)])
+    ]
 
 
 def test_receive_error_is_not_published(worker) -> None:
@@ -371,9 +373,7 @@ def test_receive_error_is_not_published(worker) -> None:
     worker._report_irecv_completions()
     error = repr(RuntimeError("recv failed"))
     assert future.events == ["done", "result", "release"]
-    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [
-        (DEFAULT_CONNECTION, "error", 0, error)
-    ]
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [(DEFAULT_CONNECTION, "error", 0, error)]
     assert worker._lwd_stager.recv_rows("a") == 0
     assert worker._lwd_stager.busy_slots() == []
 
@@ -386,9 +386,7 @@ def test_staged_event_error_is_not_published_and_cleans_slot(worker) -> None:
 
     worker._report_irecv_completions()
     assert future.events == ["done", "result", "staged_done", "result", "release"]
-    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [
-        (DEFAULT_CONNECTION, "error", 0, repr(error))
-    ]
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [(DEFAULT_CONNECTION, "error", 0, repr(error))]
     assert worker._lwd_stager.recv_rows("a") == 0
     assert worker._lwd_stager.busy_slots() == []
 
@@ -426,9 +424,7 @@ def test_submit_failure_abandons_device_allocation(worker) -> None:
     error = RuntimeError("submit failed")
     worker._data_plane.error = error
     start_early_irecv(worker, make_hint(0, ["a"], [2], [0], [4]))
-    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [
-        (DEFAULT_CONNECTION, "error", 0, repr(error))
-    ]
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [(DEFAULT_CONNECTION, "error", 0, repr(error))]
     assert worker._lwd_stager.busy_slots() == []
     assert not worker._early_recv_pending
     assert not worker._early_recv_futures
@@ -447,9 +443,7 @@ def test_loop_reports_submit_error_and_stops_reading_hints(worker) -> None:
     worker._irecv_hint_mqs = {DEFAULT_CONNECTION: NS(dequeue=dequeue)}
     worker._lwd_early_recv_loop()
 
-    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [
-        (DEFAULT_CONNECTION, "error", 4, repr(error))
-    ]
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [(DEFAULT_CONNECTION, "error", 4, repr(error))]
     assert len(dequeues) == 1
     assert worker._lwd_stager.busy_slots() == []
     assert not worker._early_recv_pending
@@ -462,9 +456,7 @@ def test_loop_reports_staged_error_and_cleans_slot(worker) -> None:
     worker._irecv_done_mqs[DEFAULT_CONNECTION].on_enqueue = worker._lwd_early_recv_stop.set
 
     worker._lwd_early_recv_loop()
-    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [
-        (DEFAULT_CONNECTION, "error", 6, repr(error))
-    ]
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [(DEFAULT_CONNECTION, "error", 6, repr(error))]
     assert worker._lwd_stager.recv_rows("a") == 0
     assert worker._lwd_stager.busy_slots() == []
 
@@ -499,7 +491,9 @@ def test_finish_before_publish_drains_descriptor_but_reports_watermark(worker) -
     assert worker._lwd_stager.staged_count == 1
 
     worker._report_irecv_completions()
-    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [((DEFAULT_CONNECTION, lwd_types.LwdChannelType.UP, 0), [])]
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [
+        ((DEFAULT_CONNECTION, lwd_types.LwdChannelType.UP, 0), [])
+    ]
     assert worker._lwd_stager.host_bytes == 0
     assert worker._lwd_stager.staged_count == 0
     assert worker._early_recv_last_delivered[DEFAULT_CONNECTION] == 0
@@ -569,9 +563,7 @@ def test_connection_failure_does_not_stop_other(two_connection_worker, failure_k
             future.staged_error = error
 
     worker._report_irecv_completions()
-    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [
-        (DEFAULT_CONNECTION, "error", 0, repr(error))
-    ]
+    assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [(DEFAULT_CONNECTION, "error", 0, repr(error))]
     assert worker._irecv_done_mqs[OTHER_CONNECTION].items == [
         ((OTHER_CONNECTION, lwd_types.LwdChannelType.UP, 0), [("b", 2)])
     ]
@@ -617,10 +609,7 @@ def test_max_inflight_two_round_robins_connections(two_connection_worker) -> Non
     assert len(worker._early_recv_futures) == 2
     assert len(worker._early_recv_pending) == 4
     worker._report_irecv_completions()
-    submitted = [
-        (lwd_types.connection_from(request), request.seqno)
-        for request in worker._data_plane.requests
-    ]
+    submitted = [(lwd_types.connection_from(request), request.seqno) for request in worker._data_plane.requests]
     assert submitted == [
         (DEFAULT_CONNECTION, 0),
         (OTHER_CONNECTION, 0),
@@ -629,10 +618,7 @@ def test_max_inflight_two_round_robins_connections(two_connection_worker) -> Non
     ]
 
     worker._report_irecv_completions()
-    submitted = [
-        (lwd_types.connection_from(request), request.seqno)
-        for request in worker._data_plane.requests
-    ]
+    submitted = [(lwd_types.connection_from(request), request.seqno) for request in worker._data_plane.requests]
     assert submitted[4:] == [(DEFAULT_CONNECTION, 2), (OTHER_CONNECTION, 2)]
     assert len(worker._early_recv_futures) == 2
     assert not worker._early_recv_pending
@@ -646,10 +632,10 @@ def test_idle_connection_capacity_is_reused(two_connection_worker) -> None:
             make_hint(seqno, ["a"], [1], [seqno], [4]),
         )
 
-    assert [
-        (lwd_types.connection_from(request), request.seqno)
-        for request in worker._data_plane.requests
-    ] == [(DEFAULT_CONNECTION, 0), (DEFAULT_CONNECTION, 1)]
+    assert [(lwd_types.connection_from(request), request.seqno) for request in worker._data_plane.requests] == [
+        (DEFAULT_CONNECTION, 0),
+        (DEFAULT_CONNECTION, 1),
+    ]
     assert len(worker._early_recv_futures) == 2
     assert not worker._early_recv_pending
 
