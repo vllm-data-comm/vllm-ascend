@@ -195,3 +195,59 @@ def test_kvpp_group_stays_inside_pipeline_stage(monkeypatch, size, pcp_size):
     if size > 1:
         groups["kvpp"].destroy.assert_called_once_with()
     assert parallel_state._KVPP is None
+
+
+def test_host_comm_builds_intra_instance_mc2(monkeypatch):
+    """Host comm skips topology groups but still initializes MC2 for W8A8 MoE."""
+    from vllm_ascend.distributed import parallel_state
+
+    for name in ("_KVPP", "_MC2", "_P_TP", "_OTP", "_LMTP", "_EMBED_TP", "_MLP_TP", "_DYNAMIC_EPLB"):
+        monkeypatch.setattr(parallel_state, name, None)
+    config = SimpleNamespace(
+        kvpp_config=SimpleNamespace(size=1),
+        pd_tp_ratio=1,
+        pd_head_ratio=1,
+        eplb_config=SimpleNamespace(dynamic_eplb=False),
+        finegrained_tp_config=SimpleNamespace(
+            oproj_tensor_parallel_size=0,
+            lmhead_tensor_parallel_size=0,
+            embedding_tensor_parallel_size=0,
+            mlp_tensor_parallel_size=0,
+        ),
+    )
+    calls, groups = {}, {}
+
+    def init_group(ranks, local_rank, backend, *, group_name):
+        calls[group_name] = (ranks, local_rank, backend)
+        groups[group_name] = MagicMock()
+        return groups[group_name]
+
+    monkeypatch.setattr(parallel_state.torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(parallel_state.torch.distributed, "get_world_size", lambda: 8)
+    monkeypatch.setattr(parallel_state.torch.distributed, "get_backend", lambda _: "hccl")
+    monkeypatch.setattr(parallel_state, "get_world_group", lambda: SimpleNamespace(local_rank=0, device_group=object()))
+    monkeypatch.setattr(parallel_state, "get_ascend_config", lambda: config)
+    monkeypatch.setattr(parallel_state, "init_model_parallel_group", init_group)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_current_vllm_config",
+        lambda: SimpleNamespace(lwd_config=SimpleNamespace(topology=SimpleNamespace(is_host_comm=True))),
+    )
+    monkeypatch.setattr(
+        parallel_state,
+        "_lwd_init_ascend_model_parallel",
+        lambda *_: pytest.fail("host comm must use the regular intra-instance group layout"),
+    )
+
+    parallel_state.init_ascend_model_parallel(
+        SimpleNamespace(
+            tensor_parallel_size=8,
+            pipeline_parallel_size=1,
+            data_parallel_size=1,
+            prefill_context_parallel_size=1,
+        )
+    )
+
+    assert calls["mc2"] == ([list(range(8))], 0, "hccl")
+    assert parallel_state.get_mc2_group() is groups["mc2"]
+    parallel_state.destroy_ascend_model_parallel()

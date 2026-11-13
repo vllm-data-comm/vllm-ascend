@@ -65,9 +65,14 @@ def init_ascend_model_parallel(
     backend = torch.distributed.get_backend(get_world_group().device_group)
     # Upstream vLLM has no lwd_config; only LWD runs import the LWD modules.
     lwd_config = getattr(get_current_vllm_config(), "lwd_config", None)
-    if lwd_config is not None:
+    if lwd_config is not None and not lwd_config.topology.is_host_comm:
         _lwd_init_ascend_model_parallel(lwd_config, backend)
         return
+    # Host comm has no shared HCCL world, but each instance still needs its
+    # native intra-instance groups (MC2 in particular, which quantized MoE
+    # methods require). Fall through to the regular group layout for those.
+    if lwd_config is not None:
+        logger.info("[LWD] data_plane_comm=host: build intra-instance groups only")
     global_tp_size = parallel_config.tensor_parallel_size
     global_dp_size = parallel_config.data_parallel_size
     global_pp_size = parallel_config.pipeline_parallel_size
@@ -197,14 +202,6 @@ def init_ascend_model_parallel(
 
 def _lwd_init_ascend_model_parallel(lwd_config: "LwdConfig", backend: str) -> None:
     """Build the Ascend groups of the HCCL world shared by the LWD edge and cloud."""
-    # Host comm (data_plane_comm=host) has NO global comm domain: the
-    # edge and cloud are separate torch worlds, so the cross-side MC2/EP
-    # rank groups cannot exist (and the topology declares no ranks).
-    # Each instance's intra-instance groups come from the regular
-    # (non-LWD) parallel init path; nothing to do here.
-    if lwd_config.topology.is_host_comm:
-        logger.info("[LWD] data_plane_comm=host: skip cross-side MC2/EPLB groups (no global comm domain)")
-        return
     from vllm_ascend.distributed.lwd_data_plane.lwd_parallel_groups import lwd_mc2_group_ranks
 
     global _MC2, _DYNAMIC_EPLB
