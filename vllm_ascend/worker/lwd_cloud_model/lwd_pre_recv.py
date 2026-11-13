@@ -246,8 +246,7 @@ def post_irecv_hint(hint: dict[str, Any]) -> None:
         # edge messages. Never substitute another connection's sender: losing
         # or misrouting the hint would stall the pre-recv gate forever.
         raise RuntimeError(
-            f"[LWD] early-recv hint for {fields.connection} seqno "
-            f"{fields.seqno} has no registered sender"
+            f"[LWD] early-recv hint for {fields.connection} seqno {fields.seqno} has no registered sender"
         )
     sender(hint)
 

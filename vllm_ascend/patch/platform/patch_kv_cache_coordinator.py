@@ -111,11 +111,7 @@ def _compression_alignment(kv_cache_config: KVCacheConfig) -> int:
         if not is_prefix_cacheable(group.kv_cache_spec):
             continue
         spec = group.kv_cache_spec
-        inner_specs = (
-            list(spec.kv_cache_specs.values())
-            if isinstance(spec, UniformTypeKVCacheSpecs)
-            else [spec]
-        )
+        inner_specs = list(spec.kv_cache_specs.values()) if isinstance(spec, UniformTypeKVCacheSpecs) else [spec]
         for inner in inner_specs:
             tokens_per_state = _safe_attr(inner, "tokens_per_state")
             if isinstance(tokens_per_state, int) and tokens_per_state > 1:

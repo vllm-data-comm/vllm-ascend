@@ -47,10 +47,7 @@ def lwd_recv_hint_mq_env(connection: Any) -> str:
     """
     if (connection.edge_id, connection.cloud_id, connection.dp_idx) == (0, 0, 0):
         return LWD_RECV_HINT_MQ_ENV
-    return (
-        f"{LWD_RECV_HINT_MQ_ENV}_E{connection.edge_id}"
-        f"C{connection.cloud_id}D{connection.dp_idx}"
-    )
+    return f"{LWD_RECV_HINT_MQ_ENV}_E{connection.edge_id}C{connection.cloud_id}D{connection.dp_idx}"
 
 
 env_variables: dict[str, Callable[[], Any]] = {

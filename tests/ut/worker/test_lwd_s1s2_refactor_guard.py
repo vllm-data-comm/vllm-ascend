@@ -197,9 +197,7 @@ def test_meta_ready_handoff_to_output_thread() -> None:
     # to the executor output thread; it must not block the compute path.
     assert "stream.wait_event(ready_event)" not in worker
     assert "done.synchronize()" not in worker
-    device = worker.index(
-        "carrier = (meta_dev, seg_lens_host, req_ids, hidden.numel(), seqno, connection)"
-    )
+    device = worker.index("carrier = (meta_dev, seg_lens_host, req_ids, hidden.numel(), seqno, connection)")
     carrier = worker.index("target.lwd_down_carriers = carriers")
     event = worker.index("target.lwd_meta_ready_events = ready_events")
     assert device < carrier < event

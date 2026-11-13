@@ -690,9 +690,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             edge_id, _ = parse_edge_id(req_id)
             candidates = [c for c in connections if c.edge_id == edge_id]
             if len(candidates) != 1:
-                raise RuntimeError(
-                    f"[Lwd][cloud-runner] req={req_id} has no unique local connection"
-                )
+                raise RuntimeError(f"[Lwd][cloud-runner] req={req_id} has no unique local connection")
             return candidates[0]
 
         grouped: dict[ConnectionId, list[LwdPromptWindow]] = {}
@@ -742,18 +740,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         stamped = getattr(self, "_lwd_request_connections", {}).get(req_id)
         if stamped is not None:
             return stamped
-        connections = (
-            getattr(self.worker, "_lwd_connections", ())
-            if self.worker is not None
-            else ()
-        )
+        connections = getattr(self.worker, "_lwd_connections", ()) if self.worker is not None else ()
         edge_id, _ = parse_edge_id(req_id)
         candidates = [c for c in connections if c.edge_id == edge_id]
         if len(candidates) != 1:
-            raise RuntimeError(
-                f"[LWD][cloud-runner] req={req_id} has no unique local "
-                f"connection for edge {edge_id}"
-            )
+            raise RuntimeError(f"[LWD][cloud-runner] req={req_id} has no unique local connection for edge {edge_id}")
         return candidates[0]
 
     def _lwd_prompt_plan(self, num_scheduled_tokens: np.ndarray) -> list[LwdPromptWindow]:
@@ -820,9 +811,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             (time.monotonic() - started) * 1000,
         )
 
-    def _lwd_h2d_copy_verified(
-        self, dst: torch.Tensor, src: torch.Tensor, rid: str, strict: bool = True
-    ) -> None:
+    def _lwd_h2d_copy_verified(self, dst: torch.Tensor, src: torch.Tensor, rid: str, strict: bool = True) -> None:
         """Pinned-to-device-window H2D copy (sync + read-back check + one retry).
 
         Root-cause fix for the 2E2C cold-start first window (2026-11, ported
@@ -871,19 +860,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             if torch.equal(dst_cpu, src_cpu):
                 return True
             if dst_cpu.is_floating_point() or dst_cpu.is_complex():
-                return bool(
-                    torch.all(
-                        (dst_cpu == src_cpu)
-                        | (torch.isnan(dst_cpu) & torch.isnan(src_cpu))
-                    ).item()
-                )
+                return bool(torch.all((dst_cpu == src_cpu) | (torch.isnan(dst_cpu) & torch.isnan(src_cpu))).item())
             return False
 
         if samples_match():
             return
         lwd_logger.warning(
-            "[LWD][cloud-runner] H2D first-copy mismatch req=%s "
-            "(sample differs after sync copy; retrying)",
+            "[LWD][cloud-runner] H2D first-copy mismatch req=%s (sample differs after sync copy; retrying)",
             rid,
         )
         dst.copy_(src, non_blocking=False)
@@ -902,9 +885,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             self._lwd_h2d_copy_stream = stream
         return stream
 
-    def _lwd_window_device(
-        self, numel: int, min_depth: int = _LWD_WINDOW_MIN_DEPTH
-    ) -> tuple[torch.Tensor, int]:
+    def _lwd_window_device(self, numel: int, min_depth: int = _LWD_WINDOW_MIN_DEPTH) -> tuple[torch.Tensor, int]:
         """Return a rotating device window protected by a prior-use event."""
         buffers = getattr(self, "_lwd_win_dev", None)
         depth = max(_LWD_WINDOW_MIN_DEPTH, min_depth)

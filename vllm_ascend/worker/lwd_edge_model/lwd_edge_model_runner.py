@@ -147,10 +147,7 @@ class LwdEdgeModelRunner(LwdBaseModelRunner):
         if isinstance(connection, int):
             connection = ConnectionId(0, 0, connection)
         if connection is None:
-            watermarks = {
-                known: self._lwd_up_send_watermarks.get(known, -1)
-                for known in self._lwd_up_send_inflight
-            }
+            watermarks = {known: self._lwd_up_send_watermarks.get(known, -1) for known in self._lwd_up_send_inflight}
         else:
             watermarks = {connection: self._lwd_up_send_watermarks.get(connection, -1)}
         return ModelRunnerOutput(
