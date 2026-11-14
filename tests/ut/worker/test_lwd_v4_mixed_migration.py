@@ -261,6 +261,101 @@ class TestCloudPreemption(unittest.TestCase):
             self.assertEqual(self.stager.consumed_rows("a"), 3)
 
 
+class FakeCopyTensor:
+    def __init__(self, value, *, drop_first=False, always_mismatch=False):
+        self.value = value
+        self.drop_first = drop_first
+        self.always_mismatch = always_mismatch
+        self.copies = 0
+
+    def copy_(self, src, non_blocking):
+        assert non_blocking is False
+        self.copies += 1
+        if self.always_mismatch or (self.drop_first and self.copies == 1):
+            return self
+        self.value.copy_(src.value)
+        return self
+
+    def __getitem__(self, item):
+        return self.value[item]
+
+
+class TestH2DCopyVerified(unittest.TestCase):
+    def setUp(self):
+        self.logger = Mock()
+        cls = load_methods(
+            RUNNER,
+            {"_lwd_h2d_copy_verified"},
+            lwd_logger=self.logger,
+        )
+        self.runner = cls()
+        self.stream = Mock()
+
+    def copy(self, src, dst, *, strict=True):
+        npu = NS(current_stream=lambda: self.stream)
+        with patch.object(torch, "npu", npu, create=True):
+            self.runner._lwd_h2d_copy_verified(dst, src, "req", strict=strict)
+
+    def test_first_mismatch_retries_and_succeeds(self):
+        src = FakeCopyTensor(torch.arange(4, dtype=torch.float32))
+        dst = FakeCopyTensor(torch.zeros(4), drop_first=True)
+
+        self.copy(src, dst)
+
+        self.assertTrue(torch.equal(dst.value, src.value))
+        self.assertEqual(dst.copies, 2)
+        self.assertEqual(self.stream.synchronize.call_count, 2)
+        self.logger.warning.assert_called_once()
+
+    def test_repeated_mismatch_honors_strict_mode(self):
+        src = FakeCopyTensor(torch.arange(4, dtype=torch.float32))
+        for strict in (True, False):
+            with self.subTest(strict=strict):
+                self.stream.reset_mock()
+                self.logger.reset_mock()
+                dst = FakeCopyTensor(torch.zeros(4), always_mismatch=True)
+                if strict:
+                    with self.assertRaisesRegex(RuntimeError, "H2D copy mismatch twice"):
+                        self.copy(src, dst, strict=True)
+                else:
+                    self.copy(src, dst, strict=False)
+                self.assertEqual(dst.copies, 2)
+                self.assertEqual(self.stream.synchronize.call_count, 2)
+                self.logger.warning.assert_called_once()
+
+    def test_zero_and_matching_nan_samples_pass_without_retry(self):
+        samples = (
+            torch.zeros(4),
+            torch.tensor([1.0, -1.0, 2.0, -2.0]),
+            torch.tensor([torch.nan, 1.0, -1.0, 0.0]),
+        )
+        for sample in samples:
+            with self.subTest(sample=sample):
+                self.stream.reset_mock()
+                src = FakeCopyTensor(sample)
+                dst = FakeCopyTensor(torch.full_like(sample, 42))
+
+                self.copy(src, dst)
+
+                torch.testing.assert_close(dst.value, src.value, equal_nan=True)
+                self.assertEqual(dst.copies, 1)
+                self.assertEqual(self.stream.synchronize.call_count, 1)
+
+    def test_mismatching_nan_honors_strict_mode(self):
+        src = FakeCopyTensor(torch.tensor([torch.nan, 1.0]))
+        for strict in (True, False):
+            with self.subTest(strict=strict):
+                self.stream.reset_mock()
+                dst = FakeCopyTensor(torch.zeros(2), always_mismatch=True)
+                if strict:
+                    with self.assertRaisesRegex(RuntimeError, "H2D copy mismatch twice"):
+                        self.copy(src, dst, strict=True)
+                else:
+                    self.copy(src, dst, strict=False)
+                self.assertEqual(dst.copies, 2)
+                self.assertEqual(self.stream.synchronize.call_count, 2)
+
+
 class TestMixedInjection(unittest.TestCase):
     def setUp(self):
         class Base:
@@ -286,6 +381,7 @@ class TestMixedInjection(unittest.TestCase):
                 "_lwd_h2d_stream",
                 "_lwd_window_device",
                 "_lwd_stage_one_request",
+                "_lwd_h2d_copy_verified",
                 "_lwd_hash_dims",
                 "_lwd_inject_remote_embeds",
                 "_lwd_decode_expert_ids",
@@ -293,15 +389,27 @@ class TestMixedInjection(unittest.TestCase):
                 "_lwd_prepare_hash_batch",
             },
             base=Base,
-            extra_classes=("LwdPromptWindow",),
+            extra_classes=("LwdPromptWindow", "LwdUpWindow"),
             time=time,
             lwd_logger=NS(info=lambda *args: None),
             hash_layer_count=routing.hash_layer_count,
             SchedulerOutput=object,
             SpecDecodeMetadata=object,
             LwdHostStager=object,
+            parse_edge_id=lambda req_id: ("edge", req_id),
+            get_tp_group=lambda: self.runner._fake_tp_group,
+            dist=NS(
+                get_rank=lambda: 1 if self.runner.worker._lwd_is_early_recv_endpoint else 0,
+                broadcast=lambda *args, **kwargs: torch.distributed.broadcast(*args, **kwargs),
+            ),
         )
         self.runner = cls()
+
+        class FakeConnection(NamedTuple):
+            edge_id: str
+
+        self.connection = FakeConnection("edge")
+        self.runner._fake_tp_group = NS(world_size=1)
         self.runner._lwd_hash_dims_cached = None
         self.a_embeds = torch.arange(8).reshape(4, 2).to(torch.bfloat16)
         self.b_embeds = (torch.arange(4) + 20).reshape(2, 2).to(torch.bfloat16)
@@ -324,7 +432,12 @@ class TestMixedInjection(unittest.TestCase):
                 expert_tail(self.b_ids),
             ]
         )
-        self.runner.worker = NS(_lwd_is_early_recv_endpoint=True, _lwd_stager=self.stager)
+        self.runner.worker = NS(
+            _lwd_is_early_recv_endpoint=True,
+            _lwd_stager=self.stager,
+            _lwd_connections=(self.connection,),
+            _lwd_up_src_ranks={self.connection: 1},
+        )
         self.runner.device = torch.device("cpu")
         self.runner.vllm_config = NS(scheduler_config=NS(max_num_batched_tokens=8))
         self.runner.model_config = NS(
@@ -359,7 +472,10 @@ class TestMixedInjection(unittest.TestCase):
                 events.append(("record", self))
 
         self.h2d_stream = NS(wait_event=lambda event: events.append(("h2d_wait", event)))
-        self.compute_stream = NS(wait_event=lambda event: events.append(("compute_wait", event)))
+        self.compute_stream = NS(
+            wait_event=lambda event: events.append(("compute_wait", event)),
+            synchronize=lambda: None,
+        )
         npu = NS(
             Stream=lambda: self.h2d_stream,
             stream=lambda stream: nullcontext(),
@@ -367,6 +483,7 @@ class TestMixedInjection(unittest.TestCase):
             current_stream=lambda: self.compute_stream,
         )
         parallel = NS(get_tp_group=lambda: tp_group or NS(world_size=1))
+        self.runner._fake_tp_group = tp_group or NS(world_size=1)
         output = NS(scheduled_new_reqs=list(new_reqs))
         with (
             patch.dict(sys.modules, {"vllm.distributed.parallel_state": parallel}),

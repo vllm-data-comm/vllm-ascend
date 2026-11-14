@@ -28,6 +28,7 @@ lwd_types = load_module(
     "lwd_types_for_pre_recv_test",
     ROOT / "vllm_ascend/distributed/lwd_data_plane/lwd_types.py",
 )
+envs = load_module("envs_for_pre_recv_test", ROOT / "vllm_ascend/envs.py")
 parents = {
     name: types.ModuleType(name)
     for name in (
@@ -41,6 +42,7 @@ pre_recv = load_module(
     ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_pre_recv.py",
     {
         **parents,
+        "vllm_ascend.envs": envs,
         "vllm_ascend.distributed.lwd_data_plane.lwd_types": lwd_types,
     },
 )
@@ -51,6 +53,7 @@ def valid_hint() -> dict:
         3,
         4,
         1,
+        connection_id=lwd_types.ConnectionId(0, 0, 0),
         req_ids=["a", "b"],
         rows=[2, 2],
         prompt_offsets=[1, 0],
@@ -61,6 +64,7 @@ def valid_hint() -> dict:
 def test_make_hint_preserves_complete_row_tables() -> None:
     hint = valid_hint()
     assert hint == {
+        "connection_id": lwd_types.ConnectionId(0, 0, 0),
         "channel": lwd_types.LwdChannelType.UP,
         "seqno": 3,
         "num_tokens": 4,
@@ -72,7 +76,8 @@ def test_make_hint_preserves_complete_row_tables() -> None:
         "refills": [],
         "prefix_nonces": [],
     }
-    assert pre_recv.hint_fields(hint) == (
+    assert pre_recv.hint_fields(hint) == pre_recv.LwdRecvHintFields(
+        lwd_types.ConnectionId(0, 0, 0),
         3,
         4,
         1,
@@ -115,7 +120,17 @@ def test_sideband_slot_is_four_kib() -> None:
 
 
 @pytest.mark.parametrize(
-    "field", ["seqno", "num_tokens", "aux_rows", "req_ids", "rows", "prompt_offsets", "prompt_lens"]
+    "field",
+    [
+        "connection_id",
+        "seqno",
+        "num_tokens",
+        "aux_rows",
+        "req_ids",
+        "rows",
+        "prompt_offsets",
+        "prompt_lens",
+    ],
 )
 def test_hint_requires_every_field_without_refill(field: str) -> None:
     hint = valid_hint()

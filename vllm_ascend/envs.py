@@ -35,6 +35,20 @@ def _strict_binary_env(name: str, default: str = "0") -> bool:
     return value == "1"
 
 
+LWD_RECV_HINT_MQ_ENV = "VLLM_ASCEND_LWD_RECV_HINT_HANDLE"
+
+
+def lwd_recv_hint_mq_env(connection: Any) -> str:
+    """Return the fixed per-connection hint-handle environment key.
+
+    Handles must be exported before workers are spawned or forked; later
+    parent-process updates are not visible to existing children. Every
+    connection - the single-edge one included - uses the qualified key, so
+    handle discovery never special-cases a default connection.
+    """
+    return f"{LWD_RECV_HINT_MQ_ENV}_E{connection.edge_id}C{connection.cloud_id}D{connection.dp_idx}"
+
+
 env_variables: dict[str, Callable[[], Any]] = {
     # max compile thread number for package building. Usually, it is set to
     # the number of CPU cores. If not set, the default value is None, which

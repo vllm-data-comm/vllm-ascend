@@ -233,12 +233,12 @@ def test_compressed_prefix_cache_hits_identical_logical_block() -> None:
     assert hit_blocks == manager.req_to_blocks[request.request_id]
 
 
-def test_hybrid_coordinator_rejects_partial_compressed_prefix_hit() -> None:
+def test_hybrid_coordinator_hits_cached_partial_compressed_prefix() -> None:
     physical_block_size = 128
     logical_block_size = physical_block_size * 4
-    request_a_tokens = list(range(logical_block_size))
+    request_a_tokens = list(range(physical_block_size + 2))
     request_b_tokens = request_a_tokens.copy()
-    request_b_tokens[physical_block_size + 7] = 999_999
+    request_b_tokens[-1] = 999_999
 
     request_a = _make_request("a", request_a_tokens, physical_block_size)
     request_b = _make_request("b", request_b_tokens, physical_block_size)
@@ -279,31 +279,31 @@ def test_hybrid_coordinator_rejects_partial_compressed_prefix_hit() -> None:
     for manager in coordinator.single_type_managers:
         manager.allocate_new_blocks(
             request_a.request_id,
-            num_tokens=logical_block_size,
-            num_tokens_main_model=logical_block_size,
+            num_tokens=physical_block_size,
+            num_tokens_main_model=physical_block_size,
         )
         manager.cache_blocks(
             request_a,
-            num_tokens=logical_block_size,
-            replay_boundaries=(logical_block_size,),
+            num_tokens=physical_block_size,
+            replay_boundaries=(physical_block_size,),
         )
 
     per_group_blocks, per_group_hits = coordinator.find_longest_cache_hit_per_group(
         request_a.block_hashes,
-        max_cache_hit_length=logical_block_size,
+        max_cache_hit_length=physical_block_size,
     )
     assert isinstance(per_group_hits, tuple)
-    assert per_group_hits == (logical_block_size, logical_block_size)
+    assert per_group_hits == (physical_block_size, physical_block_size)
     assert all(per_group_blocks)
 
     hit_result = coordinator.find_longest_cache_hit(
         request_b.block_hashes,
-        max_cache_hit_length=logical_block_size,
+        max_cache_hit_length=physical_block_size,
     )
     hit_blocks, hit_length, _ = hit_result
 
-    assert hit_length == 0
-    assert hit_blocks == ([], [])
+    assert hit_length == physical_block_size
+    assert [len(blocks) for blocks in hit_blocks] == [1, 1]
 
 
 def test_hybrid_coordinator_truncates_every_full_attention_group() -> None:

@@ -803,6 +803,116 @@ def test_deepseek_v4_scheduler_lcm_uses_logical_group_sizes() -> None:
     assert hash_block_size == 512
 
 
+def _make_deepseek_v4_prefix_coordinator(
+    *,
+    use_eagle: bool = False,
+    allow_partial_hash_hits: bool = True,
+    unsupported_manager: bool = False,
+) -> AscendHybridKVCacheCoordinator:
+    register_all_kvcache_specs(None)
+    register_ascend_kv_cache_specs()
+    groups = list(_make_deepseek_v4_kv_cache_config().kv_cache_groups)
+    if use_eagle:
+        groups[1] = replace(groups[1], is_eagle_group=True)
+    if unsupported_manager:
+        groups.append(
+            KVCacheGroupSpec(
+                ["swa"],
+                SlidingWindowMLASpec(
+                    block_size=384,
+                    num_kv_heads=1,
+                    head_size=128,
+                    dtype=torch.float16,
+                    sliding_window=384,
+                ),
+            )
+        )
+    scheduler_block_size = math.lcm(*(group.kv_cache_spec.block_size for group in groups))
+    kv_cache_config = KVCacheConfig(
+        num_blocks=32,
+        kv_cache_tensors=[],
+        kv_cache_groups=groups,
+    )
+    # Exercise the EAGLE drop; standalone and pure-producer roles suppress it.
+    kv_cache_config.kv_transfer_config = SimpleNamespace(
+        is_kv_producer=False,
+        is_kv_consumer=True,
+    )
+    return AscendHybridKVCacheCoordinator(
+        kv_cache_config,
+        max_model_len=scheduler_block_size,
+        use_eagle=use_eagle,
+        enable_caching=True,
+        enable_kv_cache_events=False,
+        dcp_world_size=1,
+        pcp_world_size=1,
+        hash_block_size=128,
+        scheduler_block_size=scheduler_block_size,
+        max_in_flight_tokens=scheduler_block_size,
+        allow_partial_hash_hits=allow_partial_hash_hits,
+    )
+
+
+def _cache_short_prompt_and_find_hit(
+    coordinator: AscendHybridKVCacheCoordinator,
+    prompt_tokens: int,
+):
+    hashes = [bytes([index + 1]) * 32 for index in range((prompt_tokens + 127) // 128)]
+    cached_tokens = prompt_tokens // 128 * 128
+    request = SimpleNamespace(
+        request_id="short",
+        block_hashes=hashes,
+        num_prompt_tokens=prompt_tokens,
+        shared_prefix_boundary=None,
+    )
+    for manager in coordinator.single_type_managers:
+        manager.allocate_new_blocks(request.request_id, cached_tokens, cached_tokens)
+    coordinator.cache_blocks(request, cached_tokens)
+    return coordinator.find_longest_cache_hit(hashes, prompt_tokens)
+
+
+@pytest.mark.parametrize("prompt_tokens", [128, 130], ids=["exact-128", "130-to-128"])
+@pytest.mark.parametrize("use_eagle", [False, True], ids=["eagle-off", "eagle-on"])
+def test_deepseek_v4_real_managers_hit_128_token_prefix(prompt_tokens, use_eagle) -> None:
+    coordinator = _make_deepseek_v4_prefix_coordinator(use_eagle=use_eagle)
+    assert all(isinstance(manager, FullAttentionManager) for manager in coordinator.single_type_managers)
+    assert coordinator.enable_partial_hash_hits
+    assert coordinator._cache_hit_alignment_tokens == 128
+
+    hit_blocks, hit_length, _ = _cache_short_prompt_and_find_hit(coordinator, prompt_tokens)
+
+    assert hit_length == (0 if use_eagle else 128)
+    assert [len(blocks) for blocks in hit_blocks] == ([0, 0] if use_eagle else [1, 1])
+
+
+@pytest.mark.parametrize(
+    ("allow_partial_hash_hits", "unsupported_manager"),
+    [
+        pytest.param(False, False, id="partial-hits-disabled"),
+        pytest.param(True, True, id="unsupported-manager-fallback"),
+    ],
+)
+def test_deepseek_v4_sub_lcm_hit_falls_back_to_scheduler_alignment(
+    allow_partial_hash_hits,
+    unsupported_manager,
+) -> None:
+    coordinator = _make_deepseek_v4_prefix_coordinator(
+        allow_partial_hash_hits=allow_partial_hash_hits,
+        unsupported_manager=unsupported_manager,
+    )
+    scheduler_block_size = coordinator.scheduler_block_size
+    assert not coordinator.enable_partial_hash_hits
+    assert coordinator._cache_hit_alignment_tokens == scheduler_block_size
+    assert all(
+        manager.cache_hit_alignment_tokens == scheduler_block_size for manager in coordinator.single_type_managers
+    )
+
+    hit_blocks, hit_length, _ = _cache_short_prompt_and_find_hit(coordinator, 130)
+
+    assert hit_length == 0
+    assert hit_blocks == tuple([] for _ in coordinator.single_type_managers)
+
+
 def test_deepseek_v4_main_restores_ascend_shared_tuple_planner(monkeypatch) -> None:
     kv_cache_config = _make_deepseek_v4_kv_cache_config()
     planned_tensor = _make_kv_cache_tensor(4096, ["c4_attn", "c128_attn"])

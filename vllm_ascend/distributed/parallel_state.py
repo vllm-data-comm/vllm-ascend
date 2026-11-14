@@ -208,6 +208,27 @@ def _lwd_init_ascend_model_parallel(lwd_config: "LwdConfig", backend: str) -> No
     group_ranks = lwd_mc2_group_ranks(lwd_config)
     local_rank = get_world_group().local_rank
     _MC2 = init_model_parallel_group(group_ranks, local_rank, backend, group_name="mc2")
+    try:
+        # Keep lazy HCCL rendezvous out of model loading: every rank reaches
+        # this collective in the same distributed-init lockstep window.
+        probe = torch.zeros(1, device="npu")
+        torch.distributed.all_reduce(probe, group=_MC2.device_group)
+    except Exception:
+        logger.exception(
+            "[LWD] MC2 eager init failed world_rank=%d local_rank=%d groups=%s device=%s",
+            torch.distributed.get_rank(),
+            local_rank,
+            group_ranks,
+            torch.npu.current_device(),
+        )
+        raise
+    logger.info(
+        "[LWD] MC2 eager init complete world_rank=%d local_rank=%d groups=%s device=%s",
+        torch.distributed.get_rank(),
+        local_rank,
+        group_ranks,
+        torch.npu.current_device(),
+    )
     if get_ascend_config().eplb_config.dynamic_eplb:
         _DYNAMIC_EPLB = init_model_parallel_group(group_ranks, local_rank, backend, group_name="dynamic_eplb")
 
