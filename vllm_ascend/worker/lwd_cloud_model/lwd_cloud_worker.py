@@ -644,9 +644,7 @@ class LwdCloudWorker(LwdWorkerBase):
         if payloads:
             is_driver = get_tp_group().is_first_rank
             carriers = []
-            legacy_carrier = None
             ready_events = {}
-            legacy_ready_event = None
             for payload in payloads:
                 connection = payload.connection
                 hidden = payload.hidden
@@ -683,9 +681,6 @@ class LwdCloudWorker(LwdWorkerBase):
                 carrier = (meta_dev, seg_lens_host, req_ids, hidden.numel(), seqno, connection)
                 carriers.append(carrier)
                 ready_events[connection] = ready_event
-                if legacy_carrier is None:
-                    legacy_carrier = carrier[:5]
-                    legacy_ready_event = ready_event
                 lwd_logger.info(
                     "[Lwd][perf] cloud-step connection=%s seqno=%d sample=%.2f send=%.2f total=%.2fms rows=%d",
                     connection,
@@ -698,11 +693,9 @@ class LwdCloudWorker(LwdWorkerBase):
             if is_driver and output is not None:
                 target = getattr(output, "_model_runner_output", output)
                 target.lwd_down_carriers = carriers
-                target.lwd_down_carrier = legacy_carrier
                 # The events belong to this output generation and must be
                 # consumed before the output crosses the process boundary.
                 target.lwd_meta_ready_events = ready_events
-                target.lwd_meta_ready_event = legacy_ready_event
         return output
 
     # ------------------------------------------------------------------ #
