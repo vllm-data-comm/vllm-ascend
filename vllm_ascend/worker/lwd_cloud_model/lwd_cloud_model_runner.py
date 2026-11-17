@@ -1113,6 +1113,14 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
           (hidden_packet, meta_dev, seg_lens_host, ready_event, req_ids)
         or None (no in-flight requests this step).
         """
+        # LWD: models whose final norm lives outside ``forward`` (Kimi-K3
+        # keeps it in compute_logits so the MTP draft sees pre-norm hidden
+        # states) must normalize the DOWN payload here. Plain/spec packing
+        # below share this tensor, so the hook only belongs at this entry.
+        finalize = getattr(self.model, "finalize_down_hidden", None)
+        if finalize is not None and sample_hidden_states is not None:
+            sample_hidden_states = finalize(sample_hidden_states)
+
         _t0 = time.monotonic()
         sampled = sampler_output.sampled_token_ids
         if sampled is None or sampled.dim() != 2 or logits is None:
