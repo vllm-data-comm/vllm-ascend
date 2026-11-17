@@ -258,12 +258,21 @@ class Glm5NextMLAAttention(nn.Module):
         self.is_v32 = config.index_topk is not None
 
         if self.is_v32:
-            self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
-                qk_rope_head_dim,
-                max_position=max_position_embeddings,
-                rope_parameters=config.rope_parameters,
-                is_neox_style=not config.indexer_rope_interleave,
-            )
+            # GLM-5.3-Flash ships qk_rope_head_dim=0 (mla_use_nope=True): the
+            # indexer runs NoPE-only and the KPool backend never consumes a
+            # rope. Ascend's RotaryEmbedding eagerly reshapes its
+            # (max_pos, 0) cos_sin cache and crashes on the empty tensor, so
+            # skip construction when there is no rope component (mirrors the
+            # rope_dim > 0 guard in the nvidia indexer forward).
+            if qk_rope_head_dim > 0:
+                self.indexer_rope_emb: RotaryEmbedding | None = get_rope(
+                    qk_rope_head_dim,
+                    max_position=max_position_embeddings,
+                    rope_parameters=config.rope_parameters,
+                    is_neox_style=not config.indexer_rope_interleave,
+                )
+            else:
+                self.indexer_rope_emb = None
             # The sparse indexer projects from the MLA q-lora rank, which is
             # always set for v32 MLA configs; narrow away the `int | None`.
             assert q_lora_rank is not None
