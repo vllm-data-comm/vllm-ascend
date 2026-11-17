@@ -29,6 +29,7 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
+from vllm_ascend.worker.lwd_debug.lwd_layer_trace import lwd_layer_trace_enabled
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
     hash_layer_count,
@@ -1064,6 +1065,20 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
         self._lwd_captured_sampler_output = None
         output = super().sample_tokens(grammar_output)
+        if captured is not None and lwd_layer_trace_enabled():
+            # Parity smoke: the edge logs the top-20 of its replayed lm_head
+            # logits, so log the cloud sampler's top-20 in the same format
+            # (scripts/lwd/lwd_trace_parity.py pairs the two logs).
+            logits = captured[1]
+            if logits is not None and logits.dim() == 2 and logits.numel() > 0:
+                row = logits[0].detach().float()
+                vals, tids = torch.topk(row, min(20, row.numel()))
+                lwd_logger.info(
+                    "[layer-trace] cloud lm_head logits shape=%s row0 l2=%.4f top20=%s",
+                    tuple(logits.shape),
+                    row.norm().item(),
+                    list(zip(tids.tolist(), [round(v, 3) for v in vals.tolist()])),
+                )
         if captured is not None and self._lwd_captured_sampler_output is not None:
             payload = self._lwd_collect_down_payload(
                 captured[0],
