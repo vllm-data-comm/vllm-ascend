@@ -128,15 +128,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         config = self.model_config.hf_config
         num_hash_layers = hash_layer_count(config)
         if num_hash_layers and vllm_config.lwd_config is not None:
-            # UP currently broadcasts one edge's batch to one cloud TP group.
-            # CP/DP need additional request-to-rank layouts before supporting V4.
+            # UP broadcasts each edge batch within its destination cloud DP's TP group.
+            # CP needs additional request-to-rank layouts before supporting V4.
             parallel = vllm_config.parallel_config
-            if (
-                parallel.data_parallel_size != 1
-                or parallel.prefill_context_parallel_size != 1
-                or parallel.decode_context_parallel_size != 1
-            ):
-                raise ValueError("LWD V4 Hash routing currently requires DP=PCP=DCP=1 (TP/EP are supported)")
+            if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
+                raise ValueError("LWD V4 Hash routing currently requires PCP=DCP=1 (DP/TP/EP are supported)")
             self.lwd_hash_state = LwdHashRoutingState(
                 num_hash_layers,
                 config.num_experts_per_tok,

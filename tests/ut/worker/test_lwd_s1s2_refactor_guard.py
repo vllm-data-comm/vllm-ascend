@@ -269,3 +269,13 @@ def test_v4_hash_wiring_on_main() -> None:
     assert 'getattr(_EXTRA_CTX, "lwd_hash_expert_ids", None)' in router_src
     assert 'hash_layer_idx = getattr(self, "hash_layer_idx", None)' in router_src
     assert "routing rows do not match router logits" in router_src
+
+
+def test_v4_hash_allows_multi_dp() -> None:
+    runner_src = (_REPO_ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_model_runner.py").read_text(
+        encoding="utf-8"
+    )
+    assert "parallel.data_parallel_size != 1" not in runner_src
+    assert "parallel.prefill_context_parallel_size != 1" in runner_src
+    assert "parallel.decode_context_parallel_size != 1" in runner_src
+    assert "DP/TP/EP are supported" in runner_src
