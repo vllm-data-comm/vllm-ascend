@@ -144,15 +144,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         config = self.model_config.hf_config
         num_hash_layers = hash_layer_count(config)
         if num_hash_layers and vllm_config.lwd_config is not None:
-            # UP currently broadcasts one edge's batch to one cloud TP group.
-            # CP/DP need additional request-to-rank layouts before supporting V4.
+            # UP broadcasts each edge batch within its destination cloud DP's TP group.
+            # CP needs additional request-to-rank layouts before supporting V4.
             parallel = vllm_config.parallel_config
-            if (
-                parallel.data_parallel_size != 1
-                or parallel.prefill_context_parallel_size != 1
-                or parallel.decode_context_parallel_size != 1
-            ):
-                raise ValueError("LWD V4 Hash routing currently requires DP=PCP=DCP=1 (TP/EP are supported)")
+            if parallel.prefill_context_parallel_size != 1 or parallel.decode_context_parallel_size != 1:
+                raise ValueError("LWD V4 Hash routing currently requires PCP=DCP=1 (DP/TP/EP are supported)")
             self.lwd_hash_state = LwdHashRoutingState(
                 num_hash_layers,
                 config.num_experts_per_tok,
@@ -957,10 +953,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
 
         The check compares the first 16 destination elements with the same
         source elements, including matching NaNs. All-zero and zero-sum data
-        therefore pass. ``strict=False`` is for the expert-ID tail: retry a
-        mismatch once, but never fail; the retry is idempotent. The standing
-        cost is one blocking copy plus a bounded sample comparison on the H2D
-        stream.
+        therefore pass the element-wise comparison — but a full-buffer
+        absolute-sum guard catches the case where a lost copy leaves dst
+        all-zero while src is non-zero and the head-16 sample happens to
+        match (both zero).  ``strict=False`` is for the expert-ID tail: retry
+        a mismatch once, but never fail; the retry is idempotent. The
+        standing cost is one blocking copy plus a bounded sample comparison
+        and one reduction on the H2D stream.
 
         Sync scope: the read-back only needs the *issuing* stream drained,
         which the blocking ``copy_`` already guarantees, so a stream-level
@@ -978,6 +977,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         src_sample = src[:_LWD_H2D_VERIFY_ELEMENTS]
 
         def samples_match() -> bool:
+            # Full-buffer guard: a silently dropped copy_ leaves dst all
+            # zero; if src is non-zero this is always a failure even when
+            # the head-16 sample happens to match (both zero).
+            if float(src.abs().sum()) != 0.0 and float(dst.abs().sum()) == 0.0:
+                return False
             try:
                 if torch.equal(dst_sample, src_sample):
                     return True

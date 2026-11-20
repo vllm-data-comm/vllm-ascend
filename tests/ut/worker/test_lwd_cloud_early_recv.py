@@ -351,7 +351,7 @@ def test_aborted_refill_reports_only_watermark(worker) -> None:
     scheduler_output = NS(
         lwd_batch=NS(
             batch_type=FakeBatchType.LWD_EMBED,
-            batch_meta=NS(aborted_req_ids=["a"]),
+            batch_meta=NS(connection_id=DEFAULT_CONNECTION, aborted_req_ids=["a"]),
         )
     )
     worker._lwd_up_post_recvs(scheduler_output)
@@ -484,7 +484,12 @@ def test_abort_only_batch_and_finish_release_host_descriptors(worker) -> None:
         lwd_batch=NS(
             batch_type=FakeBatchType.LWD_EMBED,
             seqno=-1,
-            batch_meta=NS(req_ids=[], token_ids=[], aborted_req_ids=["a"]),
+            batch_meta=NS(
+                connection_id=DEFAULT_CONNECTION,
+                req_ids=[],
+                token_ids=[],
+                aborted_req_ids=["a"],
+            ),
         )
     )
     worker._lwd_up_post_recvs(scheduler_output)

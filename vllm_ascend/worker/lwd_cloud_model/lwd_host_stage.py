@@ -23,12 +23,10 @@ from typing import Protocol
 from vllm.distributed.lwd.lwd_types import ConnectionId
 from vllm.lwd_logger import lwd_logger
 
-LwdStageKey = int | tuple[ConnectionId, int]
+LwdStageKey = tuple[ConnectionId, int]
 
 
 def _stage_sort_key(key: LwdStageKey) -> tuple[int, int, int, int]:
-    if isinstance(key, int):
-        return (0, 0, 0, key)
     connection, seqno = key
     return (connection.edge_id, connection.cloud_id, connection.dp_idx, seqno)
 
@@ -276,15 +274,12 @@ class LwdHostStager:
         self._req_connections: dict[str, ConnectionId] = {}
         self._ended_req_ids: set[str] = set()
         self._end_pending: dict[str, set[LwdStageKey]] = {}
-        self._end_after: dict[str, LwdStageKey] = {}
+        self._end_after: dict[str, LwdStageKey | None] = {}
         self._end_waiting: set[str] = set()
-        self._last_delivered: LwdStageKey = -1
+        self._last_delivered: LwdStageKey | None = None
         self._batch_reqs: dict[LwdStageKey, list[str]] = {}
         self._arrival_plan: dict[LwdStageKey, list[tuple[LwdReqEmbed, int, int]]] = {}
-        # (connection, req_id, prefix_nonce); connection is None for
-        # single-connection (int) stage keys. Drained per connection so one
-        # edge never consumes another edge's refill completion.
-        self._refill_done: list[tuple[ConnectionId | None, str, int]] = []
+        self._refill_done: list[tuple[ConnectionId, str, int]] = []
         self._host_bytes = 0
         self._released_requests = 0
         self._aborted_requests = 0
@@ -345,7 +340,7 @@ class LwdHostStager:
             req = self._reqs.get(req_id)
             return req._stage_floor if req is not None else 0
 
-    def take_refill_done(self, connection: ConnectionId | None = None) -> list[tuple[str, int]]:
+    def take_refill_done(self, connection: ConnectionId) -> list[tuple[str, int]]:
         """Drain refill completions of one connection, keeping the rest."""
         with self._lock:
             done = [(req_id, nonce) for conn, req_id, nonce in self._refill_done if conn == connection]
@@ -402,7 +397,7 @@ class LwdHostStager:
             keys = {
                 key
                 for key in (*self._batches.keys(), *self._arrival_plan.keys(), *self._seqno_slot.keys())
-                if isinstance(key, tuple) and key[0] == connection
+                if key[0] == connection
             }
             req_ids = {req_id for key in keys for req_id in self._batch_reqs.get(key, ())}
             req_ids.update(req_id for req_id, owner in self._req_connections.items() if owner == connection)
@@ -463,9 +458,8 @@ class LwdHostStager:
         segments: list[tuple[LwdBuffer, int, int]] = []
         plan: list[tuple[LwdReqEmbed, int, int]] = []
         with self._lock:
-            if isinstance(seqno, tuple):
-                for req_id in req_ids:
-                    self._req_connections.setdefault(req_id, seqno[0])
+            for req_id in req_ids:
+                self._req_connections.setdefault(req_id, seqno[0])
             source_row = 0
             for index, req_id in enumerate(req_ids):
                 host: LwdReqEmbed | None = None
@@ -507,7 +501,7 @@ class LwdHostStager:
 
     def publish_received(self, seqno: LwdStageKey) -> list[tuple[str, int, int]]:
         """Publish active D2H arrivals and release the receive slot."""
-        connection = seqno[0] if isinstance(seqno, tuple) else None
+        connection = seqno[0]
         with self._lock:
             plan = self._arrival_plan.pop(seqno, None)
             if plan is None:
@@ -528,7 +522,7 @@ class LwdHostStager:
             slot = self._seqno_slot.pop(seqno, -1)
             if slot >= 0:
                 self._slot_owner[slot] = -1
-            if self._last_delivered == -1 or _stage_sort_key(seqno) > _stage_sort_key(self._last_delivered):
+            if self._last_delivered is None or _stage_sort_key(seqno) > _stage_sort_key(self._last_delivered):
                 self._last_delivered = seqno
             self._complete_end_plan(seqno, delivered=True)
         return rows
@@ -648,8 +642,11 @@ class LwdHostStager:
                 self._end_waiting.discard(req_id)
             if self._end_pending.get(req_id):
                 continue
-            if delivered and _stage_sort_key(self._last_delivered) < _stage_sort_key(self._end_after[req_id]):
-                continue
+            end_after = self._end_after[req_id]
+            if delivered and end_after is not None:
+                assert self._last_delivered is not None
+                if _stage_sort_key(self._last_delivered) < _stage_sort_key(end_after):
+                    continue
             self._ended_req_ids.discard(req_id)
             self._end_pending.pop(req_id, None)
             self._end_after.pop(req_id, None)

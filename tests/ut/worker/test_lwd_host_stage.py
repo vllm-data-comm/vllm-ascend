@@ -33,6 +33,12 @@ LwdHostStageSlotBusy = module.LwdHostStageSlotBusy
 LwdHostStager = module.LwdHostStager
 
 HIDDEN = 4
+CONNECTION = module.ConnectionId(0, 0, 0)
+OTHER_CONNECTION = module.ConnectionId(1, 0, 0)
+
+
+def stage_key(seqno: int, connection=CONNECTION):
+    return (connection, seqno)
 
 
 class FakeBuffer:
@@ -72,9 +78,10 @@ def plan_chunk(
     req_id: str = "r0",
     refill: bool = False,
     prefix_nonce: int = 0,
+    connection=CONNECTION,
 ) -> list[tuple[FakeBuffer, int, int]]:
     return stager.plan_recv_segments(
-        seqno=seqno,
+        seqno=stage_key(seqno, connection),
         numel=rows * HIDDEN,
         hidden_size=HIDDEN,
         req_ids=[req_id],
@@ -88,24 +95,24 @@ def plan_chunk(
 
 def test_multi_chunk_arrival_and_read_coordinates() -> None:
     stager = make_stager()
-    _, slot = stager.allocate(1, 2 * HIDDEN)
+    _, slot = stager.allocate(stage_key(1), 2 * HIDDEN)
     first = plan_chunk(stager, 1, rows=2, prompt_rows=6)
     assert [(view.start, source, size) for view, source, size in first] == [(0, 0, 8)]
     req = stager.take_req("r0")
     assert req.host.numel() == 6 * HIDDEN
     original_host = req.host
 
-    assert stager.publish_received(1) == [("r0", 2, 0)]
+    assert stager.publish_received(stage_key(1)) == [("r0", 2, 0)]
     assert stager.busy_slots() == []
     assert stager.recv_rows("r0") == 2
     assert stager.segment_for("r0", 2) == (0, 8, ())
     stager.consume("r0", 2)
 
-    stager.allocate(2, 3 * HIDDEN)
+    stager.allocate(stage_key(2), 3 * HIDDEN)
     second = plan_chunk(stager, 2, rows=3, offset=2, prompt_rows=6)
     assert [(view.start, source, size) for view, source, size in second] == [(8, 0, 12)]
     assert stager.take_req("r0").host is original_host
-    assert stager.publish_received(2) == [("r0", 3, 2)]
+    assert stager.publish_received(stage_key(2)) == [("r0", 3, 2)]
     assert stager.recv_rows("r0") == 5
     assert stager.consumed_rows("r0") == 2
     assert stager.segment_for("r0", 3) == (8, 12, ())
@@ -115,14 +122,14 @@ def test_multi_chunk_arrival_and_read_coordinates() -> None:
 def test_duplicate_arrival_is_idempotent() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=2, prompt_rows=6)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     plan_chunk(stager, 2, rows=3, offset=2, prompt_rows=6)
-    stager.publish_received(2)
+    stager.publish_received(stage_key(2))
     assert stager.recv_rows("r0") == 5
 
     duplicate = plan_chunk(stager, 3, rows=3, offset=2, prompt_rows=6)
     assert [(view.start, source, size) for view, source, size in duplicate] == [(8, 0, 12)]
-    assert stager.publish_received(3) == [("r0", 3, 2)]
+    assert stager.publish_received(stage_key(3)) == [("r0", 3, 2)]
     assert stager.recv_rows("r0") == 5
     assert stager.take_req("r0").available() == 5
 
@@ -137,7 +144,7 @@ def test_nonzero_first_chunk_seeds_prefix_watermarks() -> None:
     with pytest.raises(LwdHostStageGeometryError, match="after arrivals"):
         req.seed_prefix(2)
 
-    assert stager.publish_received(1) == [("r0", 2, 2)]
+    assert stager.publish_received(stage_key(1)) == [("r0", 2, 2)]
     assert stager.recv_rows("r0") == 4
     assert stager.segment_for("r0", 2) == (8, 8, ())
     with pytest.raises(LwdHostStageGeometryError, match="before drain"):
@@ -148,14 +155,14 @@ def test_nonzero_first_chunk_seeds_prefix_watermarks() -> None:
 def test_refill_completion_hole_and_second_refill() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=6, offset=4, prompt_rows=10)
-    stager.publish_received(1)
-    assert stager.take_refill_done() == []
+    stager.publish_received(stage_key(1))
+    assert stager.take_refill_done(CONNECTION) == []
 
     assert stager.rewind_consumed("r0", 2)
     plan_chunk(stager, 2, rows=2, offset=2, prompt_rows=10, refill=True)
-    stager.publish_received(2)
-    assert stager.take_refill_done() == [("r0", 0)]
-    assert stager.take_refill_done() == []
+    stager.publish_received(stage_key(2))
+    assert stager.take_refill_done(CONNECTION) == [("r0", 0)]
+    assert stager.take_refill_done(CONNECTION) == []
     assert stager.stage_floor("r0") == 2
     assert stager.recv_rows("r0") == 10
     assert stager.segment_for("r0", 2) == (8, 8, ())
@@ -163,14 +170,14 @@ def test_refill_completion_hole_and_second_refill() -> None:
 
     assert stager.rewind_consumed("r0", 0)
     plan_chunk(stager, 3, rows=1, offset=0, prompt_rows=10, refill=True)
-    stager.publish_received(3)
-    assert stager.take_refill_done() == []
+    stager.publish_received(stage_key(3))
+    assert stager.take_refill_done(CONNECTION) == []
     with pytest.raises(LwdHostStageGeometryError, match="unfilled refill hole"):
         stager.segment_for("r0", 2)
 
     plan_chunk(stager, 4, rows=1, offset=1, prompt_rows=10, refill=True)
-    stager.publish_received(4)
-    assert stager.take_refill_done() == [("r0", 0)]
+    stager.publish_received(stage_key(4))
+    assert stager.take_refill_done(CONNECTION) == [("r0", 0)]
     assert stager.stage_floor("r0") == 0
     assert stager.segment_for("r0", 2) == (0, 8, ())
 
@@ -178,24 +185,54 @@ def test_refill_completion_hole_and_second_refill() -> None:
 def test_refill_done_preserves_prefix_nonce() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=6, offset=4, prompt_rows=10, prefix_nonce=7)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     plan_chunk(stager, 2, rows=2, offset=2, prompt_rows=10, refill=True, prefix_nonce=7)
 
-    stager.publish_received(2)
-    assert stager.take_refill_done() == [("r0", 7)]
+    stager.publish_received(stage_key(2))
+    assert stager.take_refill_done(CONNECTION) == [("r0", 7)]
+
+
+def test_refill_completion_is_isolated_by_connection_at_same_seqno() -> None:
+    stager = make_stager()
+    for connection, req_id in ((CONNECTION, "r0"), (OTHER_CONNECTION, "r1")):
+        plan_chunk(
+            stager,
+            1,
+            rows=2,
+            offset=2,
+            prompt_rows=4,
+            req_id=req_id,
+            connection=connection,
+        )
+        stager.publish_received(stage_key(1, connection))
+        plan_chunk(
+            stager,
+            2,
+            rows=1,
+            offset=1,
+            prompt_rows=4,
+            req_id=req_id,
+            refill=True,
+            connection=connection,
+        )
+        stager.publish_received(stage_key(2, connection))
+
+    assert stager.take_refill_done(CONNECTION) == [("r0", 0)]
+    assert stager.take_refill_done(OTHER_CONNECTION) == [("r1", 0)]
+    assert stager.take_refill_done(CONNECTION) == []
 
 
 def test_refill_gap_overrun_and_flag_mismatch_fail_fast() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=6, offset=4, prompt_rows=10)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     plan_chunk(stager, 2, rows=1, offset=1, prompt_rows=10, refill=True)
-    stager.publish_received(2)
+    stager.publish_received(stage_key(2))
 
     plan_chunk(stager, 3, rows=1, offset=3, prompt_rows=10, refill=True)
     with pytest.raises(LwdHostStageGeometryError, match="refill gap"):
-        stager.publish_received(3)
-    assert stager.take_refill_done() == []
+        stager.publish_received(stage_key(3))
+    assert stager.take_refill_done(CONNECTION) == []
     with pytest.raises(LwdHostStageGeometryError, match="overrun stage floor"):
         plan_chunk(stager, 4, rows=2, offset=3, prompt_rows=10, refill=True)
     with pytest.raises(LwdHostStageGeometryError, match="refill flag"):
@@ -205,23 +242,23 @@ def test_refill_gap_overrun_and_flag_mismatch_fail_fast() -> None:
 def test_aborted_refill_is_not_reported() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=6, offset=4, prompt_rows=10)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     plan_chunk(stager, 2, rows=2, offset=2, prompt_rows=10, refill=True)
     assert stager.abort_request("r0")
 
-    assert stager.publish_received(2) == []
-    assert stager.take_refill_done() == []
+    assert stager.publish_received(stage_key(2)) == []
+    assert stager.take_refill_done(CONNECTION) == []
     assert stager.stage_floor("r0") == 4
 
 
 def test_gap_and_out_of_bounds_fail_fast() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=2, prompt_rows=6)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
 
     plan_chunk(stager, 2, rows=1, offset=4, prompt_rows=6)
     with pytest.raises(LwdHostStageGeometryError, match="arrival gap"):
-        stager.publish_received(2)
+        stager.publish_received(stage_key(2))
     assert stager.recv_rows("r0") == 2
 
     with pytest.raises(LwdHostStageGeometryError, match="exceed prompt_rows"):
@@ -232,27 +269,27 @@ def test_gap_and_out_of_bounds_fail_fast() -> None:
 
 def test_slot_busy_and_abandon() -> None:
     stager = make_stager(slots=1, max_numel=16)
-    view, slot = stager.allocate(1, 8)
+    view, slot = stager.allocate(stage_key(1), 8)
     assert (view.numel(), slot) == (8, 0)
     assert stager.busy_slots() == [0]
     with pytest.raises(LwdHostStageSlotBusy):
-        stager.allocate(2, 8)
+        stager.allocate(stage_key(2), 8)
 
-    stager.abandon(1)
-    stager.abandon(1)
+    stager.abandon(stage_key(1))
+    stager.abandon(stage_key(1))
     assert stager.busy_slots() == []
-    assert stager.allocate(2, 8)[1] == 0
+    assert stager.allocate(stage_key(2), 8)[1] == 0
     with pytest.raises(LwdHostStageGeometryError, match="slot capacity"):
-        stager.allocate(3, 17)
+        stager.allocate(stage_key(3), 17)
 
 
 def test_abort_is_idempotent_and_release_is_at_request_end() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=2, prompt_rows=6)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     assert stager.host_bytes == 6 * HIDDEN * 2
-    assert stager.batches_holding("r0") == [1]
-    assert not stager.release_if_drained(1)
+    assert stager.batches_holding("r0") == [stage_key(1)]
+    assert not stager.release_if_drained(stage_key(1))
 
     assert stager.abort_request("r0")
     assert stager.abort_request("r0")
@@ -266,14 +303,14 @@ def test_abort_is_idempotent_and_release_is_at_request_end() -> None:
     assert stager.release_request("r0") == 0
     assert stager.host_bytes == 0
     assert stager.released_requests == 1
-    assert stager.release_if_drained(1)
+    assert stager.release_if_drained(stage_key(1))
     assert stager.staged_count == 0
 
 
 def test_full_consumption_finishes_without_early_release() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=4, prompt_rows=4)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     stager.consume("r0", 4)
 
     assert stager.take_req("r0").done()
@@ -286,7 +323,7 @@ def test_full_consumption_finishes_without_early_release() -> None:
 def test_rewind_consumed_preserves_arrival_and_rereads() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=4, prompt_rows=6)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     stager.consume("r0", 4)
     req = stager.take_req("r0")
 
@@ -311,7 +348,7 @@ def test_rewind_consumed_preserves_arrival_and_rereads() -> None:
 def test_skip_consumed_for_self_hit_stays_within_recv() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=4, prompt_rows=6)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     stager.consume("r0", 2)
 
     assert stager.skip_consumed("r0", 4)
@@ -330,7 +367,7 @@ def test_dsv4_embed_and_tail_source_offsets() -> None:
     num_experts_per_tok = 3
     tail_per_row = 4 * num_hash_layers * num_experts_per_tok
     segments = stager.plan_recv_segments(
-        seqno=1,
+        seqno=stage_key(1),
         numel=3 * (HIDDEN + tail_per_row),
         hidden_size=HIDDEN,
         req_ids=["r0", "r1"],
@@ -344,12 +381,12 @@ def test_dsv4_embed_and_tail_source_offsets() -> None:
         (0, 8, 4),
         (12, 60, 24),
     ]
-    batch = stager.batch(1)
+    batch = stager.batch(stage_key(1))
     assert batch.src_offsets == [0, 8]
     assert batch.src_tail_offsets == [(12,), (60,)]
     assert stager.take_req("r0").host.numel() == 56
     assert stager.take_req("r1").host.numel() == 84
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     assert stager.segment_for("r0", 2) == (0, 8, (8,))
     assert stager.segment_for("r1", 1) == (0, 4, (12,))
 
@@ -358,7 +395,7 @@ def test_dsv4_embed_and_tail_source_offsets() -> None:
     assert stager.segment_for("r1", 1) == (0, 4, (12,))
     stager.consume("r1", 1)
     continuation = stager.plan_recv_segments(
-        seqno=2,
+        seqno=stage_key(2),
         numel=2 * (HIDDEN + tail_per_row),
         hidden_size=HIDDEN,
         req_ids=["r1"],
@@ -371,7 +408,7 @@ def test_dsv4_embed_and_tail_source_offsets() -> None:
         (4, 0, 8),
         (36, 8, 48),
     ]
-    stager.publish_received(2)
+    stager.publish_received(stage_key(2))
     assert stager.segment_for("r1", 2) == (4, 8, (36,))
 
 
@@ -388,14 +425,14 @@ def test_dsv4_refill_reuses_embed_and_tail_layout() -> None:
         "tail_sizes": (tail_per_row,),
     }
     stager.plan_recv_segments(
-        seqno=1,
+        seqno=stage_key(1),
         numel=2 * (HIDDEN + tail_per_row),
         row_base=[2],
         **common,
     )
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     refill = stager.plan_recv_segments(
-        seqno=2,
+        seqno=stage_key(2),
         numel=2 * (HIDDEN + tail_per_row),
         row_base=[0],
         refills=[True],
@@ -403,8 +440,8 @@ def test_dsv4_refill_reuses_embed_and_tail_layout() -> None:
     )
 
     assert [(view.start, source, size) for view, source, size in refill] == [(0, 0, 8), (16, 8, 48)]
-    stager.publish_received(2)
-    assert stager.take_refill_done() == [("r0", 0)]
+    stager.publish_received(stage_key(2))
+    assert stager.take_refill_done(CONNECTION) == [("r0", 0)]
     assert stager.rewind_consumed("r0", 0)
     assert stager.segment_for("r0", 2) == (0, 8, (16,))
 
@@ -412,12 +449,12 @@ def test_dsv4_refill_reuses_embed_and_tail_layout() -> None:
 def test_read_consume_and_table_geometry_errors() -> None:
     stager = make_stager()
     with pytest.raises(LwdHostStageGeometryError, match="equal length"):
-        stager.plan_recv_segments(1, 8, HIDDEN, ["r0"], [2], [])
+        stager.plan_recv_segments(stage_key(1), 8, HIDDEN, ["r0"], [2], [])
     with pytest.raises(LwdHostStageGeometryError, match="payload"):
-        stager.plan_recv_segments(1, 9, HIDDEN, ["r0"], [2], [2])
+        stager.plan_recv_segments(stage_key(1), 9, HIDDEN, ["r0"], [2], [2])
 
     plan_chunk(stager, 1, rows=2, prompt_rows=4)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     with pytest.raises(LwdHostStageGeometryError, match="received rows"):
         stager.segment_for("r0", 3)
     with pytest.raises(LwdHostStageGeometryError, match="consumed end"):
@@ -430,16 +467,16 @@ def test_read_consume_and_table_geometry_errors() -> None:
 
 def test_abandon_rolls_back_plan_and_only_new_hosts() -> None:
     stager = make_stager(slots=1)
-    stager.allocate(1, 2 * HIDDEN)
+    stager.allocate(stage_key(1), 2 * HIDDEN)
     plan_chunk(stager, 1, rows=2, prompt_rows=6)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     original = stager.take_req("r0")
     original_bytes = stager.host_bytes
     original_staged_count = stager.staged_count
 
-    stager.allocate(2, 3 * HIDDEN)
+    stager.allocate(stage_key(2), 3 * HIDDEN)
     stager.plan_recv_segments(
-        seqno=2,
+        seqno=stage_key(2),
         numel=3 * HIDDEN,
         hidden_size=HIDDEN,
         req_ids=["r0", "r1"],
@@ -449,7 +486,7 @@ def test_abandon_rolls_back_plan_and_only_new_hosts() -> None:
     )
     assert stager.take_req("r1") is not None
     assert stager.busy_slots() == [0]
-    stager.abandon(2)
+    stager.abandon(stage_key(2))
 
     assert stager.busy_slots() == []
     assert stager.host_bytes == original_bytes
@@ -457,21 +494,21 @@ def test_abandon_rolls_back_plan_and_only_new_hosts() -> None:
     assert stager.take_req("r0") is original
     assert stager.recv_rows("r0") == 2
     assert stager.take_req("r1") is None
-    assert stager.batch(2) is None
-    assert stager.batches_holding("r0") == [1]
+    assert stager.batch(stage_key(2)) is None
+    assert stager.batches_holding("r0") == [stage_key(1)]
     with pytest.raises(LwdHostStageGeometryError, match="no arrival plan"):
-        stager.publish_received(2)
+        stager.publish_received(stage_key(2))
 
 
 def test_abandon_rolls_back_seeded_fresh_host() -> None:
     stager = make_stager(slots=1)
-    stager.allocate(1, 2 * HIDDEN)
+    stager.allocate(stage_key(1), 2 * HIDDEN)
     plan_chunk(stager, 1, rows=2, offset=2, prompt_rows=6)
     seeded = stager.take_req("r0")
     assert seeded.recv_rows == 2
     assert stager.host_bytes == 48
 
-    stager.abandon(1)
+    stager.abandon(stage_key(1))
     assert stager.take_req("r0") is None
     assert stager.host_bytes == 0
     assert stager.request_count == 0
@@ -479,8 +516,8 @@ def test_abandon_rolls_back_seeded_fresh_host() -> None:
 
     plan_chunk(stager, 2, rows=2, offset=2, prompt_rows=6)
     published = stager.take_req("r0")
-    stager.publish_received(2)
-    stager.abandon(2)
+    stager.publish_received(stage_key(2))
+    stager.abandon(stage_key(2))
     assert stager.take_req("r0") is published
     assert stager.recv_rows("r0") == 4
     assert stager.host_bytes == 48
@@ -489,75 +526,75 @@ def test_abandon_rolls_back_seeded_fresh_host() -> None:
 def test_abort_drains_all_old_plans_before_request_id_reuse() -> None:
     stager = make_stager(slots=2)
     plan_chunk(stager, 1, rows=2, prompt_rows=8)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     plan_chunk(stager, 2, rows=2, offset=2, prompt_rows=8)
     plan_chunk(stager, 3, rows=2, offset=4, prompt_rows=8)
     assert stager.abort_request("r0")
     assert stager.release_request("r0") == 64
 
     assert plan_chunk(stager, 4, rows=2, offset=4, prompt_rows=8) == []
-    assert not stager.release_if_drained(2)
-    assert stager.publish_received(2) == []
+    assert not stager.release_if_drained(stage_key(2))
+    assert stager.publish_received(stage_key(2)) == []
     assert plan_chunk(stager, 5, rows=2, offset=4, prompt_rows=8, prefix_nonce=2) == []
-    assert stager.publish_received(3) == []
+    assert stager.publish_received(stage_key(3)) == []
 
     reused = plan_chunk(stager, 6, rows=2, prompt_rows=4, prefix_nonce=2)
     assert [(view.start, source, size) for view, source, size in reused] == [(0, 0, 8)]
     assert stager.take_req("r0").prefix_nonce == 2
-    assert stager.publish_received(4) == []
-    assert stager.publish_received(5) == []
-    assert stager.publish_received(6) == [("r0", 2, 0)]
+    assert stager.publish_received(stage_key(4)) == []
+    assert stager.publish_received(stage_key(5)) == []
+    assert stager.publish_received(stage_key(6)) == [("r0", 2, 0)]
     assert stager.recv_rows("r0") == 2
     assert stager.host_bytes == 32
     for seqno in (2, 3, 4, 5):
-        assert stager.release_if_drained(seqno)
-    assert not stager.release_if_drained(6)
+        assert stager.release_if_drained(stage_key(seqno))
+    assert not stager.release_if_drained(stage_key(6))
     assert stager.release_request("r0") == 32
-    assert stager.release_if_drained(6)
+    assert stager.release_if_drained(stage_key(6))
 
 
 def test_finish_drains_old_plan_and_allows_request_id_reuse() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=2, prompt_rows=4)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     plan_chunk(stager, 2, rows=2, offset=2, prompt_rows=4)
     assert stager.release_request("r0") == 32
 
     assert plan_chunk(stager, 3, rows=2, offset=2, prompt_rows=4) == []
-    assert not stager.release_if_drained(2)
-    assert stager.publish_received(2) == []
+    assert not stager.release_if_drained(stage_key(2))
+    assert stager.publish_received(stage_key(2)) == []
     reused = plan_chunk(stager, 4, rows=1, prompt_rows=2)
     assert [(view.start, source, size) for view, source, size in reused] == [(0, 0, 4)]
-    assert stager.publish_received(3) == []
-    assert stager.publish_received(4) == [("r0", 1, 0)]
+    assert stager.publish_received(stage_key(3)) == []
+    assert stager.publish_received(stage_key(4)) == [("r0", 1, 0)]
     assert stager.recv_rows("r0") == 1
-    assert stager.release_if_drained(2)
-    assert stager.release_if_drained(3)
+    assert stager.release_if_drained(stage_key(2))
+    assert stager.release_if_drained(stage_key(3))
 
 
 def test_finish_without_pending_allows_immediate_request_id_reuse() -> None:
     stager = make_stager()
     plan_chunk(stager, 1, rows=2, prompt_rows=2)
-    stager.publish_received(1)
+    stager.publish_received(stage_key(1))
     stager.consume("r0", 2)
     assert stager.release_request("r0") == 16
-    assert stager.release_if_drained(1)
+    assert stager.release_if_drained(stage_key(1))
 
     reused = plan_chunk(stager, 2, rows=2, prompt_rows=2)
     assert [(view.start, source, size) for view, source, size in reused] == [(0, 0, 8)]
-    assert stager.publish_received(2) == [("r0", 2, 0)]
+    assert stager.publish_received(stage_key(2)) == [("r0", 2, 0)]
     assert stager.request_count == 1
     assert stager.host_bytes == 16
     assert stager.release_request("r0") == 16
-    assert stager.release_if_drained(2)
+    assert stager.release_if_drained(stage_key(2))
 
 
 def test_mixed_batch_skips_old_generation_without_shifting_sources() -> None:
     stager = make_stager(slots=1)
     assert not stager.abort_request("done")
-    stager.allocate(1, 5 * HIDDEN)
+    stager.allocate(stage_key(1), 5 * HIDDEN)
     segments = stager.plan_recv_segments(
-        seqno=1,
+        seqno=stage_key(1),
         numel=5 * HIDDEN,
         hidden_size=HIDDEN,
         req_ids=["done", "live"],
@@ -566,21 +603,21 @@ def test_mixed_batch_skips_old_generation_without_shifting_sources() -> None:
     )
     assert [(view.start, source, size) for view, source, size in segments] == [(0, 8, 12)]
     assert stager.take_req("done") is None
-    assert stager.batch(1).src_offsets == [0, 8]
-    assert stager.batch(1).src_tail_offsets == [(), ()]
-    assert stager.batch(1).total_rows == 5
+    assert stager.batch(stage_key(1)).src_offsets == [0, 8]
+    assert stager.batch(stage_key(1)).src_tail_offsets == [(), ()]
+    assert stager.batch(stage_key(1)).total_rows == 5
     assert plan_chunk(stager, 2, rows=2, prompt_rows=2, req_id="done") == []
 
-    assert stager.publish_received(1) == [("live", 3, 0)]
+    assert stager.publish_received(stage_key(1)) == [("live", 3, 0)]
     reused = plan_chunk(stager, 3, rows=2, prompt_rows=2, req_id="done")
     assert [(view.start, source, size) for view, source, size in reused] == [(0, 0, 8)]
-    assert stager.publish_received(2) == []
-    assert stager.publish_received(3) == [("done", 2, 0)]
+    assert stager.publish_received(stage_key(2)) == []
+    assert stager.publish_received(stage_key(3)) == [("done", 2, 0)]
     assert stager.busy_slots() == []
     assert stager.recv_rows("done") == 2
     assert stager.recv_rows("live") == 3
-    assert stager.release_if_drained(2)
+    assert stager.release_if_drained(stage_key(2))
     assert stager.release_request("done") == 16
-    assert stager.release_if_drained(3)
+    assert stager.release_if_drained(stage_key(3))
     assert stager.release_request("live") == 24
-    assert stager.release_if_drained(1)
+    assert stager.release_if_drained(stage_key(1))

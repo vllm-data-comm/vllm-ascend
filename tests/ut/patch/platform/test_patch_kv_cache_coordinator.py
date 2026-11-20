@@ -38,6 +38,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.v1.core.kv_cache_coordinator import SpecGroup
+from vllm.v1.core.single_type_kv_cache_manager import MambaManager
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheConfig,
@@ -77,13 +78,19 @@ class _FakeBlockPool:
 
 
 class _FakeFAManager:
+    supports_fine_grained_hash_lookup = True
+
     def __init__(self, **kwargs):
         self.use_eagle = False
+        self.block_size = FA_SPEC.block_size
 
 
 class _FakeMambaManager:
+    supports_fine_grained_hash_lookup = True
+
     def __init__(self, **kwargs):
         self.use_eagle = False
+        self.block_size = MAMBA_SPEC.block_size
 
 
 def _fake_manager_factory(**kwargs):
@@ -190,6 +197,31 @@ def test_coordinator_reads_standalone_drop_exemption(monkeypatch):
     # block, so the EAGLE drop is suppressed just like on the producer.
     coordinator = _make_coordinator(monkeypatch, use_eagle=True, kv_transfer_config=None)
     assert coordinator.skips_eagle_block_drop is True
+
+
+def test_standalone_replay_retains_materialized_prompt_boundary(monkeypatch):
+    """Suppressing EAGLE drop must not also rewind sparse replay retention."""
+    coordinator = _make_coordinator(
+        monkeypatch,
+        use_eagle=True,
+        kv_transfer_config=None,
+    )
+    coordinator.scheduler_block_size = MAMBA_SPEC.block_size
+    request = SimpleNamespace(num_prompt_tokens=6814)
+
+    replay_boundaries = coordinator.get_replay_boundaries(request)
+
+    assert replay_boundaries == (6813,)
+    block_mask = MambaManager.reachable_block_mask(
+        start_block=0,
+        end_block=4,
+        alignment_tokens=MAMBA_SPEC.block_size,
+        kv_cache_spec=MAMBA_SPEC,
+        use_eagle=False,
+        retention_interval=0,
+        reachable_boundaries=replay_boundaries,
+    )
+    assert block_mask == [False, False, False, True]
 
 
 @pytest.mark.parametrize(

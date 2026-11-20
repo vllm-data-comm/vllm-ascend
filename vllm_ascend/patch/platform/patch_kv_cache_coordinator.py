@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.request import Request
 
 from vllm_ascend.core.kv_cache_interface import is_prefix_cacheable
 
@@ -309,6 +310,12 @@ class AscendHybridKVCacheCoordinator(HybridKVCacheCoordinator):
         # of typical ~2K prompts, pinning P-side prefix hits to 0.
         kv_transfer_config = getattr(kv_cache_config, "kv_transfer_config", None)
         self.skips_eagle_block_drop = _skips_eagle_block_drop(kv_transfer_config)
+
+    def get_replay_boundaries(self, request: Request) -> tuple[int, ...]:
+        """Match replay retention to the lookup path's EAGLE-drop policy."""
+        if self.skips_eagle_block_drop:
+            return (request.num_prompt_tokens - 1,)
+        return super().get_replay_boundaries(request)
 
     @property
     def _cache_hit_alignment_tokens(self) -> int:

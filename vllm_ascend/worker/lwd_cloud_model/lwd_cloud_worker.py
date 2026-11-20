@@ -92,7 +92,9 @@ class LwdCloudWorker(LwdWorkerBase):
             if connection.connection_id.dp_idx == self._lwd_dp_idx
         )
         if not self._lwd_connections:
-            self._lwd_connections = (ConnectionId(0, lwd_config.instance.id, self._lwd_dp_idx),)
+            raise RuntimeError(
+                f"[Lwd][cloud-worker] no topology connection for cloud={lwd_config.instance.id} dp={self._lwd_dp_idx}"
+            )
         global_rank = dist.get_rank()
         # One description of the UP main frame, shared with the edge: the
         # worker sizes and stages what the runner unpacks. Supersedes the

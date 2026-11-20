@@ -49,13 +49,13 @@ class _Io:
 def _instance(identity: int, prefix: str, *, cloud: bool) -> dict[str, Any]:
     dp: dict[str, Any] = {"dp_idx": 0, "addr": f"{prefix}.{identity + 1}"}
     if cloud:
-        dp["ctrl_port"] = 5550 + identity
+        dp["ctrl_port"] = 5550
         dp["data_port"] = CLOUD_DATA_PORT + identity
-    # The scene validator needs coordination on every instance; an edge also
-    # needs an HTTP endpoint and a key file.
+        dp["coord_port"] = 8100 + identity
+    # Direct coordination uses per-DP coord_url/coord_port instead of the
+    # retired instance-level control_url field.
     dp_coordination: dict[str, Any] = {"enabled": True}
     if not cloud:
-        dp_coordination["control_url"] = f"http://10.9.0.{identity + 1}:8100"
         dp_coordination["tenant_key_file"] = f"/etc/lwd/tenant-{identity}.key"
     return {"id": identity, "dp": [dp], "coordination": dp_coordination}
 

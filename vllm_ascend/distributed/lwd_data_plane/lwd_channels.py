@@ -269,12 +269,9 @@ def lwd_channels_initialized() -> bool:
 
 
 def _lwd_channel(
-    dp_idx: int,
+    connection: ConnectionId,
     channel: LwdChannelType,
-    edge_id: int,
-    cloud_id: int,
 ) -> tuple[dist.ProcessGroup, int]:
-    connection = ConnectionId(edge_id, cloud_id, dp_idx)
     try:
         return _LWD_CHANNEL_GROUPS[(connection, channel)]
     except KeyError:
@@ -286,36 +283,27 @@ def _lwd_channel(
 
 def lwd_get_channel_device_group(
     channel: LwdChannelType,
-    dp_idx: int = 0,
-    *,
-    edge_id: int = 0,
-    cloud_id: int = 0,
+    connection: ConnectionId,
 ) -> dist.ProcessGroup:
-    group, _ = _lwd_channel(dp_idx, channel, edge_id, cloud_id)
+    group, _ = _lwd_channel(connection, channel)
     return group
 
 
 def lwd_get_channel_peer(
     channel: LwdChannelType,
-    dp_idx: int = 0,
-    *,
-    edge_id: int = 0,
-    cloud_id: int = 0,
+    connection: ConnectionId,
 ) -> int:
     """Global rank of this process's P2P peer on the connection's channel."""
-    _, peer = _lwd_channel(dp_idx, channel, edge_id, cloud_id)
+    _, peer = _lwd_channel(connection, channel)
     return peer
 
 
 def lwd_get_channel_stream(
     channel: LwdChannelType,
-    dp_idx: int = 0,
-    *,
-    edge_id: int = 0,
-    cloud_id: int = 0,
+    connection: ConnectionId,
 ) -> torch.npu.Stream:
-    _lwd_channel(dp_idx, channel, edge_id, cloud_id)
-    return _LWD_CHANNEL_STREAMS[(ConnectionId(edge_id, cloud_id, dp_idx), channel)]
+    _lwd_channel(connection, channel)
+    return _LWD_CHANNEL_STREAMS[(connection, channel)]
 
 
 def lwd_destroy_channels() -> None:
