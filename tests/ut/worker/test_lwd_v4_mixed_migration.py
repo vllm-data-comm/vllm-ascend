@@ -750,3 +750,36 @@ class TestDrafterRouting(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_profile_dummy_run_disables_only_inner_compilation() -> None:
+    from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import (
+        LwdBaseModelRunner,
+    )
+    from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
+        LwdCloudModelRunner,
+    )
+
+    inner_model = object()
+    model = NS(language_model=NS(model=inner_model))
+    runner = LwdCloudModelRunner.__new__(LwdCloudModelRunner)
+    runner.lwd_engram_inputs = None
+    runner._lwd_hash_step_tokens = None
+
+    with (
+        patch(
+            "vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner.disable_compilation",
+            return_value=nullcontext(),
+        ) as disable,
+        patch.object(LwdBaseModelRunner, "_dummy_run", return_value="ok") as parent,
+        patch.object(runner, "get_model", return_value=model),
+    ):
+        assert runner._dummy_run(8, is_profile=True) == "ok"
+        disable.assert_called_once_with(inner_model)
+        parent.assert_called_once_with(8, is_profile=True)
+
+        disable.reset_mock()
+        parent.reset_mock()
+        assert runner._dummy_run(8, is_profile=False) == "ok"
+        disable.assert_not_called()
+        parent.assert_called_once_with(8, is_profile=False)

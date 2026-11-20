@@ -45,6 +45,7 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import (
 )
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import LwdHashRoutingState
+from vllm_ascend.worker.utils import disable_compilation
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -654,7 +655,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self._lwd_hash_step_tokens = None
         if self.lwd_engram_inputs is not None:
             self.lwd_engram_inputs.end_step()
-        return super()._dummy_run(*args, **kwargs)
+        if not kwargs.get("is_profile", False):
+            return super()._dummy_run(*args, **kwargs)
+        model = self.get_model()
+        with disable_compilation(getattr(model, "language_model", model).model):
+            return super()._dummy_run(*args, **kwargs)
 
     def _model_forward(
         self,
