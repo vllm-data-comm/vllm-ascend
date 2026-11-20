@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 from vllm.v1.worker.lwd_edge.lwd_edge_gpu_model_runner import (
     LwdEdgeGPUModelRunner,
 )
@@ -10,6 +12,10 @@ from vllm.v1.worker.lwd_edge.lwd_edge_gpu_model_runner import (
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import (
     LwdBaseModelRunner,
 )
+from vllm_ascend.worker.lwd_debug.lwd_layer_trace import lwd_trace_replay
+
+if TYPE_CHECKING:
+    import torch
 
 
 class LwdEdgeModelRunner(LwdEdgeGPUModelRunner, LwdBaseModelRunner):
@@ -22,3 +28,20 @@ class LwdEdgeModelRunner(LwdEdgeGPUModelRunner, LwdBaseModelRunner):
         )
 
         install_lwd_layer_trace(self.get_model())
+
+    def _lwd_trace_replay(
+        self,
+        seqno: int,
+        logits: torch.Tensor,
+        selected_ids: list[int],
+        ranks: list[int],
+        req_ids: list[str],
+    ) -> None:
+        lwd_trace_replay(
+            side="edge",
+            logits=logits,
+            selected_ids=selected_ids,
+            ranks=ranks,
+            req_ids=req_ids,
+            seqno=seqno,
+        )

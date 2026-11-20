@@ -30,11 +30,50 @@ import torch
 
 _LWD_TRACE_ENV = "VLLM_ASCEND_LWD_LAYER_TRACE"
 _MAX_STEPS = 3
+_MAX_REPLAY_BATCHES = 8
+_MAX_REPLAY_ROWS = 8
+_MAX_REPLAY_TOPK = 20
 _state: dict[str, int] = {"step": 0}
+_replay_steps: dict[str, int] = {}
 
 
 def lwd_layer_trace_enabled() -> bool:
     return os.getenv(_LWD_TRACE_ENV, "") == "1"
+
+
+def lwd_trace_replay(
+    *,
+    side: str,
+    logits: torch.Tensor,
+    selected_ids: torch.Tensor | list[int],
+    ranks: torch.Tensor | list[int],
+    req_ids: list[str],
+    seqno: int | None = None,
+) -> None:
+    """Compare local cloud selections with local edge replay, never on the wire."""
+    if not lwd_layer_trace_enabled():
+        return
+    step = _replay_steps.get(side, 0) + 1
+    _replay_steps[side] = step
+    if step > _MAX_REPLAY_BATCHES or logits.ndim != 2 or not req_ids:
+        return
+    selected = selected_ids.tolist() if isinstance(selected_ids, torch.Tensor) else selected_ids
+    rank_values = ranks.tolist() if isinstance(ranks, torch.Tensor) else ranks
+    rows = min(len(req_ids), _MAX_REPLAY_ROWS)
+    row = logits[0].detach().float()
+    values, token_ids = torch.topk(row, min(_MAX_REPLAY_TOPK, row.numel()))
+    from vllm.lwd_logger import lwd_logger as log
+
+    log.info(
+        "[replay-trace] side=%s step=%d seqno=%s req_ids=%s selected=%s ranks=%s top20=%s",
+        side,
+        step,
+        seqno,
+        req_ids[:rows],
+        selected[:rows],
+        rank_values[:rows],
+        list(zip(token_ids.tolist(), [round(v, 3) for v in values.tolist()])),
+    )
 
 
 def lwd_tensor_checksum(tag: str, tensor: Any) -> str:
@@ -76,7 +115,8 @@ def _make_hook(label: str) -> Callable[..., None]:
             return
         log.info(
             "[layer-trace] step=%d %s in[%s] out[%s]",
-            _state["step"], label,
+            _state["step"],
+            label,
             lwd_tensor_checksum("h", _hidden_from(inputs)),
             lwd_tensor_checksum("h", _hidden_from(output)),
         )
@@ -87,9 +127,7 @@ def _make_hook(label: str) -> Callable[..., None]:
 def _make_step_hook() -> Callable[..., None]:
     from vllm.lwd_logger import lwd_logger as log
 
-    def pre_hook(
-        module: "torch.nn.Module", args: "tuple[torch.Tensor, ...]"
-    ) -> None:
+    def pre_hook(module: "torch.nn.Module", args: "tuple[torch.Tensor, ...]") -> None:
         _state["step"] += 1
         if _state["step"] <= _MAX_STEPS:
             log.info("[layer-trace] ==== forward step=%d ====", _state["step"])
@@ -111,10 +149,7 @@ def _find_text_backbone(
     for holder in candidates:
         if holder is None:
             continue
-        layers = (
-            getattr(holder, "layers", None)
-            or getattr(holder, "decoder_layers", None)
-        )
+        layers = getattr(holder, "layers", None) or getattr(holder, "decoder_layers", None)
         if layers is not None:
             return holder, layers
     return None, None
@@ -134,6 +169,7 @@ def install_lwd_layer_trace(model: "torch.nn.Module") -> None:
         return
     model._lwd_layer_traced = True
     from vllm.lwd_logger import lwd_logger as log
+
     backbone, layers = _find_text_backbone(model)
     if layers is None:
         log.warning(
@@ -143,12 +179,13 @@ def install_lwd_layer_trace(model: "torch.nn.Module") -> None:
         )
         return
     log.info(
-        "[layer-trace] model=%s decoder_layers=%d first=%s last=%s "
-        "norm=%s lm_head=%s",
-        type(model).__name__, len(layers),
+        "[layer-trace] model=%s decoder_layers=%d first=%s last=%s norm=%s lm_head=%s",
+        type(model).__name__,
+        len(layers),
         list(backbone.named_children())[0][0] if layers else "-",
         f"layer{len(layers) - 1}",
-        hasattr(backbone, "norm"), hasattr(model, "lm_head"),
+        hasattr(backbone, "norm"),
+        hasattr(model, "lm_head"),
     )
     backbone.register_forward_pre_hook(_make_step_hook())
     embed = getattr(backbone, "embed_tokens", None)

@@ -18,6 +18,41 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (  # noqa:
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import (  # noqa: E402
     LwdTokenRankEncoder,
 )
+from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (  # noqa: E402
+    lwd_trace_replay,
+)
+
+
+def test_replay_trace_reports_local_ids_and_top_logits(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("VLLM_ASCEND_LWD_LAYER_TRACE", "1")
+    records = []
+    monkeypatch.setattr("vllm.lwd_logger.lwd_logger.info", lambda *args: records.append(args))
+
+    lwd_trace_replay(
+        side="cloud-test",
+        logits=torch.tensor([[1.0, 4.0, 2.0]]),
+        selected_ids=torch.tensor([1]),
+        ranks=[0],
+        req_ids=["request-a"],
+    )
+
+    assert len(records) == 1
+    assert records[0][5] == [1]
+    assert records[0][6] == [0]
+    assert records[0][7] == [(1, 4.0), (2, 2.0), (0, 1.0)]
+
+
+def test_replay_trace_is_inert_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_ASCEND_LWD_LAYER_TRACE", raising=False)
+    monkeypatch.setattr(torch, "topk", lambda *args, **kwargs: pytest.fail("topk ran while trace was disabled"))
+
+    lwd_trace_replay(
+        side="edge-test",
+        logits=torch.tensor([[1.0]]),
+        selected_ids=[0],
+        ranks=[0],
+        req_ids=["request-a"],
+    )
 
 
 def assert_round_trip(

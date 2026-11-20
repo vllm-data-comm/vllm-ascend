@@ -44,6 +44,7 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import (
     LwdMultiKVCacheGroupMTPProposer,
 )
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
+from vllm_ascend.worker.lwd_debug.lwd_layer_trace import lwd_trace_replay
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import LwdHashRoutingState
 from vllm_ascend.worker.utils import disable_compilation
 
@@ -1347,6 +1348,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         lg_sel = logits if full_cover else logits[idx]
         sm_sel = sampled[:, 0] if full_cover else sampled[idx][:, 0]
         ranks = [self._lwd_token_rank_encoder.encode(lg_sel, sm_sel)]
+        lwd_trace_replay(
+            side="cloud",
+            logits=lg_sel,
+            selected_ids=sm_sel,
+            ranks=ranks[0],
+            req_ids=[batch_req_ids[i] for i in idx],
+        )
         hidden_packet = torch.cat([sample_hidden_states[i : i + 1] for i in idx])
         return LwdDownSelection(
             hidden_packet=hidden_packet,
@@ -1423,6 +1431,13 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             lg_rows = logits[sel_d]
             hidden_packet = sample_hidden_states[sel_d]
         ranks = [self._lwd_token_rank_encoder.encode(lg_rows, sampled_rows)]
+        lwd_trace_replay(
+            side="cloud",
+            logits=lg_rows,
+            selected_ids=sampled_rows,
+            ranks=ranks[0],
+            req_ids=[batch_req_ids[i] for i in req_idx_np.tolist()],
+        )
         # Stale sampled slots (requests the spec step skipped may retain
         # the previous spec step's tokens): accepted/ranks/seg_lens are
         # all capped by the actual hidden row count — the row count is
