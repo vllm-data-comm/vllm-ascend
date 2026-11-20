@@ -29,6 +29,7 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import LwdBaseModelRunner
 from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import LwdMTPProposer
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
+from vllm_ascend.worker.lwd_debug.lwd_layer_trace import lwd_layer_trace_enabled
 from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
     LwdHashRoutingState,
     hash_layer_count,
@@ -1068,6 +1069,20 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             )
         self._lwd_captured_sampler_output = None
         output = super().sample_tokens(grammar_output)
+        if captured is not None and lwd_layer_trace_enabled():
+            # Parity smoke: the edge logs the top-20 of its replayed lm_head
+            # logits, so log the cloud sampler's top-20 in the same format
+            # (scripts/lwd/lwd_trace_parity.py pairs the two logs).
+            logits = captured[1]
+            if logits is not None and logits.dim() == 2 and logits.numel() > 0:
+                row = logits[0].detach().float()
+                vals, tids = torch.topk(row, min(20, row.numel()))
+                lwd_logger.info(
+                    "[layer-trace] cloud lm_head logits shape=%s row0 l2=%.4f top20=%s",
+                    tuple(logits.shape),
+                    row.norm().item(),
+                    list(zip(tids.tolist(), [round(v, 3) for v in vals.tolist()])),
+                )
         if captured is not None and self._lwd_captured_sampler_output is not None:
             payload = self._lwd_collect_down_payload(
                 captured[0],
@@ -1117,6 +1132,14 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
           (hidden_packet, meta_dev, seg_lens_host, ready_event, req_ids)
         or None (no in-flight requests this step).
         """
+        # LWD: models whose final norm lives outside ``forward`` (Kimi-K3
+        # keeps it in compute_logits so the MTP draft sees pre-norm hidden
+        # states) must normalize the DOWN payload here. Plain/spec packing
+        # below share this tensor, so the hook only belongs at this entry.
+        finalize = getattr(self.model, "finalize_down_hidden", None)
+        if finalize is not None and sample_hidden_states is not None:
+            sample_hidden_states = finalize(sample_hidden_states)
+
         _t0 = time.monotonic()
         sampled = sampler_output.sampled_token_ids
         if sampled is None or sampled.dim() != 2 or logits is None:
