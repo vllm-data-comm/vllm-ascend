@@ -279,94 +279,81 @@ class FakeCopyTensor:
     def __getitem__(self, item):
         return self.value[item]
 
+    def __getattr__(self, name):
+        return getattr(self.value, name)
 
-class TestH2DCopyVerified(unittest.TestCase):
+
+class TestH2DVerifyAfterReady(unittest.TestCase):
+    """The async path no longer copies inside the verifier; the copy is
+    submitted by the stage and the verifier only reads back and retries."""
+
     def setUp(self):
         self.logger = Mock()
         cls = load_methods(
             RUNNER,
-            {"_lwd_h2d_copy_verified"},
+            {"_lwd_h2d_verify_after_ready"},
             lwd_logger=self.logger,
         )
         self.runner = cls()
-        self.stream = Mock()
 
-    def copy(self, src, dst, *, strict=True):
-        npu = NS(current_stream=lambda: self.stream)
+    def verify(self, src, dst, *, strict=True):
+        npu = NS(current_stream=Mock)
         with patch.object(torch, "npu", npu, create=True):
-            self.runner._lwd_h2d_copy_verified(dst, src, "req", strict=strict)
+            self.runner._lwd_h2d_verify_after_ready(dst, src, "req", strict=strict)
 
-    def test_first_mismatch_retries_and_succeeds(self):
-        src = FakeCopyTensor(torch.arange(4, dtype=torch.float32))
-        dst = FakeCopyTensor(torch.zeros(4), drop_first=True)
+    def test_lost_async_copy_is_retried(self):
+        src = FakeCopyTensor(torch.tensor([1.0, 2.0, 3.0]))
+        dst = FakeCopyTensor(torch.zeros(3))
 
-        self.copy(src, dst)
+        self.verify(src, dst)
 
         self.assertTrue(torch.equal(dst.value, src.value))
-        self.assertEqual(dst.copies, 2)
-        self.assertEqual(self.stream.synchronize.call_count, 2)
+        self.assertEqual(dst.copies, 1)
         self.logger.warning.assert_called_once()
 
     def test_head16_zero_but_full_window_loss_is_retried(self):
-        # src 前 16 元素为零，但整个窗口非零；dst 第一次 copy_ 被丢弃（全零）。
-        # 旧的前 16 校验会误判通过（前 16 都是零），全窗口守卫应判失败并重试。
+        # src's head 16 elements are zero but the whole window is not; the
+        # first copy_ was dropped (dst all zero). The old head-16 check would
+        # have passed (both zero); the full-window guard must retry.
         src = FakeCopyTensor(torch.cat([torch.zeros(16), torch.tensor([1.0])]))
-        dst = FakeCopyTensor(torch.zeros(17), drop_first=True)
+        dst = FakeCopyTensor(torch.zeros(17))
 
-        self.copy(src, dst)
+        self.verify(src, dst)
 
-        self.assertEqual(dst.copies, 2)
         self.assertTrue(torch.equal(dst.value, src.value))
-        self.assertEqual(self.stream.synchronize.call_count, 2)
+        self.assertEqual(dst.copies, 1)
         self.logger.warning.assert_called_once()
 
-    def test_repeated_mismatch_honors_strict_mode(self):
-        src = FakeCopyTensor(torch.arange(4, dtype=torch.float32))
+    def test_completed_async_copy_passes_without_retry(self):
+        src = FakeCopyTensor(torch.tensor([1.0, 2.0, 3.0]))
+        dst = FakeCopyTensor(torch.tensor([1.0, 2.0, 3.0]))
+
+        self.verify(src, dst)
+
+        self.assertEqual(dst.copies, 0)
+        self.logger.warning.assert_not_called()
+
+    def test_zero_src_is_legitimate(self):
+        src = FakeCopyTensor(torch.zeros(3))
+        dst = FakeCopyTensor(torch.zeros(3))
+
+        self.verify(src, dst)
+
+        self.assertEqual(dst.copies, 0)
+
+    def test_retry_failure_honors_strict_mode(self):
+        src = FakeCopyTensor(torch.tensor([1.0, 2.0, 3.0]))
         for strict in (True, False):
             with self.subTest(strict=strict):
-                self.stream.reset_mock()
                 self.logger.reset_mock()
-                dst = FakeCopyTensor(torch.zeros(4), always_mismatch=True)
+                dst = FakeCopyTensor(torch.zeros(3), always_mismatch=True)
                 if strict:
                     with self.assertRaisesRegex(RuntimeError, "H2D copy mismatch twice"):
-                        self.copy(src, dst, strict=True)
+                        self.verify(src, dst, strict=True)
                 else:
-                    self.copy(src, dst, strict=False)
-                self.assertEqual(dst.copies, 2)
-                self.assertEqual(self.stream.synchronize.call_count, 2)
-                self.logger.warning.assert_called_once()
-
-    def test_zero_and_matching_nan_samples_pass_without_retry(self):
-        samples = (
-            torch.zeros(4),
-            torch.tensor([1.0, -1.0, 2.0, -2.0]),
-            torch.tensor([torch.nan, 1.0, -1.0, 0.0]),
-        )
-        for sample in samples:
-            with self.subTest(sample=sample):
-                self.stream.reset_mock()
-                src = FakeCopyTensor(sample)
-                dst = FakeCopyTensor(torch.full_like(sample, 42))
-
-                self.copy(src, dst)
-
-                torch.testing.assert_close(dst.value, src.value, equal_nan=True)
+                    self.verify(src, dst, strict=False)
                 self.assertEqual(dst.copies, 1)
-                self.assertEqual(self.stream.synchronize.call_count, 1)
-
-    def test_mismatching_nan_honors_strict_mode(self):
-        src = FakeCopyTensor(torch.tensor([torch.nan, 1.0]))
-        for strict in (True, False):
-            with self.subTest(strict=strict):
-                self.stream.reset_mock()
-                dst = FakeCopyTensor(torch.zeros(2), always_mismatch=True)
-                if strict:
-                    with self.assertRaisesRegex(RuntimeError, "H2D copy mismatch twice"):
-                        self.copy(src, dst, strict=True)
-                else:
-                    self.copy(src, dst, strict=False)
-                self.assertEqual(dst.copies, 2)
-                self.assertEqual(self.stream.synchronize.call_count, 2)
+                self.logger.warning.assert_called_once()
 
 
 class TestMixedInjection(unittest.TestCase):
@@ -394,7 +381,8 @@ class TestMixedInjection(unittest.TestCase):
                 "_lwd_h2d_stream",
                 "_lwd_window_device",
                 "_lwd_stage_one_request",
-                "_lwd_h2d_copy_verified",
+                "_lwd_verify_staged_plan",
+                "_lwd_h2d_verify_after_ready",
                 "_lwd_hash_dims",
                 "_lwd_inject_remote_embeds",
                 "_lwd_decode_expert_ids",
