@@ -99,7 +99,7 @@ class LwdEngramBatchView(NamedTuple):
 @dataclass
 class _LwdEngramRecord:
     image_spans: np.ndarray
-    """int64 [num_spans, 3], from the request's first chunk."""
+    """int64 [num_spans, 3], from the request's first received chunk."""
     tail_cells: np.ndarray
     """int64 [lookback_depth] window values of prompt positions ``P - 1 - t``."""
     tail_filled: np.ndarray
@@ -211,32 +211,28 @@ class LwdEngramInputs:
         spans: list[int],
         embeds: torch.Tensor,
     ) -> None:
-        """Record the request's image spans, and its tail once the tail arrives.
+        """Create the record on the first received chunk and fill the prompt tail.
 
-        The spans ride the first chunk. The tail is the last ``lookback_depth``
-        prompt positions, so its ids are looked up from the embeddings of the
-        chunk that holds them, which is the last one.
+        The first received chunk can start after zero when prefix caching covers
+        the prompt prefix. The full-request spans are supplied on every call and
+        are read only when creating the record. The tail is the last
+        ``lookback_depth`` prompt positions, so its ids are looked up from the
+        embeddings of the chunk that holds them, which is the last one.
 
         Args:
             req_id: The request this chunk belongs to.
             start: Prompt offset of the chunk.
             prompt_len: Prompt tokens of the request.
-            spans: Flattened image placeholder spans, on the first chunk only.
+            spans: Flattened image placeholder spans of the request.
             embeds: ``[chunk tokens, hidden]`` UP embeddings of this chunk.
 
         Raises:
-            ValueError: The spans are missing, malformed, duplicated, or ride a
-                chunk other than the first.
+            ValueError: The spans are malformed or fall outside the prompt.
         """
-        if start == 0:
-            if req_id in self._records:
-                raise ValueError(f"[LWD] duplicate Engram record for {req_id}")
-            self._records[req_id] = self._new_record(req_id, prompt_len, spans)
-        elif spans:
-            raise ValueError(f"[LWD] {req_id} carries an Engram record on its chunk at offset {start}")
         record = self._records.get(req_id)
         if record is None:
-            raise ValueError(f"[LWD] {req_id} has no Engram record on its chunk at offset {start}")
+            record = self._new_record(req_id, prompt_len, spans)
+            self._records[req_id] = record
         self._fill_tail(req_id, record, start, prompt_len, embeds)
 
     def _new_record(self, req_id: str, prompt_len: int, spans: list[int]) -> _LwdEngramRecord:

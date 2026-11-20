@@ -1108,9 +1108,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             if engram is not None:
                 if engram_hashes is None:
                     raise RuntimeError(f"[Lwd][cloud-runner] missing UP Engram hashes for {window.req_id}")
-                # The record is created by the first chunk and holds the whole
-                # request's spans; later chunks must present none.
-                spans = self._lwd_image_spans.get(window.req_id, []) if window.start == 0 else []
+                # The first received chunk creates the record, even when a
+                # prefix hit makes its prompt offset nonzero.
+                spans = self._lwd_image_spans.get(window.req_id, [])
                 engram.add_prompt_chunk(
                     window.req_id,
                     window.start,
