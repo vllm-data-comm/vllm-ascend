@@ -8,14 +8,15 @@ import pytest
 
 torch = pytest.importorskip("torch", reason="LWD rank replay needs torch")
 
+from vllm.v1.worker.lwd_edge.lwd_edge_gpu_model_runner import (  # noqa: E402
+    select_token_batch,
+)
+
 from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (  # noqa: E402
     LwdCloudModelRunner,
 )
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import (  # noqa: E402
     LwdTokenRankEncoder,
-)
-from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (  # noqa: E402
-    select_token_batch,
 )
 
 

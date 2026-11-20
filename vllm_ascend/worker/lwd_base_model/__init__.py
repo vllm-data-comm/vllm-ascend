@@ -2,8 +2,6 @@
 """Shared LWD worker bring-up.
 
 - ``lwd_worker_base``: common NPUWorker base for the edge/cloud workers
-- ``lwd_pinned_staging``: rotating pinned staging buffers shared by
-  edge/cloud host transfers
-- ``lwd_base_model_runner``: LWD runner base (worker back-ref + named
-  lazy staging factory)
+- ``lwd_base_model_runner``: NPU runner initialization and the shared
+  lazy staging factory; pinned staging itself lives in vLLM
 """

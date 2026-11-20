@@ -26,7 +26,7 @@ def load_module(name: str, path: Path, modules: dict[str, types.ModuleType] | No
 
 lwd_types = load_module(
     "lwd_types_for_pre_recv_test",
-    ROOT / "vllm_ascend/distributed/lwd_data_plane/lwd_types.py",
+    ROOT.parent / "vllm" / "vllm" / "distributed/lwd/lwd_types.py",
 )
 envs = load_module("envs_for_pre_recv_test", ROOT / "vllm_ascend/envs.py")
 parents = {
@@ -43,7 +43,7 @@ pre_recv = load_module(
     {
         **parents,
         "vllm_ascend.envs": envs,
-        "vllm_ascend.distributed.lwd_data_plane.lwd_types": lwd_types,
+        "vllm.distributed.lwd.lwd_types": lwd_types,
     },
 )
 

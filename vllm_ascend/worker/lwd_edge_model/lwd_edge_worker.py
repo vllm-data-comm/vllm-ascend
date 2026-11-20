@@ -63,8 +63,7 @@ class LwdEdgeWorker(LwdWorkerBase):
         # The LWD edge's runtime forward is hijacked by the LWD flow
         # (execute_model only dispatches to the runner's embed/unembed
         # direct calls), so model-level warmup and cudagraph capture are
-        # never used; and under the 0-layer topology a full forward would
-        # fail unpacking at the final norm. Skip entirely.
+        # never used; the dedicated edge model has no decoder forward to warm.
         from vllm.v1.worker.worker_base import CompilationTimes
 
         lwd_logger.info("[lwd-edge] skip model warmup/capture (forward is hijacked by LWD)")

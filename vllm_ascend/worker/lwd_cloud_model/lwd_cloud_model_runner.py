@@ -19,13 +19,14 @@ from typing import TYPE_CHECKING, NamedTuple
 import numpy as np
 import torch
 import torch.distributed as dist
+from vllm.distributed.lwd.lwd_types import ConnectionId
 from vllm.distributed.parallel_state import get_pp_group, get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.lwd_logger import lwd_logger
+from vllm.v1.lwd_comm.lwd_up_payload import LwdUpPayloadLayout, hash_layer_count
 from vllm.v1.lwd_control.lwd_comm.lwd_id_adapter import parse_edge_id
 from vllm.v1.outputs import ModelRunnerOutput
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId
 from vllm_ascend.spec_decode.multi_kv_cache_group_proposer import (
     is_multi_kv_cache_group_mtp,
 )
@@ -43,11 +44,7 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_mtp_proposer import (
     LwdMultiKVCacheGroupMTPProposer,
 )
 from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import LwdTokenRankEncoder
-from vllm_ascend.worker.lwd_hash.lwd_hash_routing import (
-    LwdHashRoutingState,
-    hash_layer_count,
-)
-from vllm_ascend.worker.lwd_hash.lwd_up_payload import LwdUpPayloadLayout
+from vllm_ascend.worker.lwd_hash.lwd_hash_routing import LwdHashRoutingState
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -332,9 +329,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             self.lwd_engram_inputs.plan_step(
                 self._lwd_engram_batch_view(self.input_batch.num_reqs),
                 num_scheduled_tokens,
-                self._lwd_engram_staging(
-                    "engram_row_codes", torch.int32, self.lwd_engram_inputs.row_codes_capacity
-                ),
+                self._lwd_engram_staging("engram_row_codes", torch.int32, self.lwd_engram_inputs.row_codes_capacity),
             )
         return out
 
@@ -733,9 +728,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         """
         layout = self._lwd_up_layout_cached
         if layout is None:
-            layout = LwdUpPayloadLayout.from_hf_config(
-                self.model_config.get_hidden_size(), self.model_config.hf_config
-            )
+            layout = LwdUpPayloadLayout.from_hf_config(self.model_config.get_hidden_size(), self.model_config.hf_config)
             self._lwd_up_layout_cached = layout
         return layout
 
@@ -1085,7 +1078,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         if dev is None:
             return
         layout = self.lwd_up_layout()
-        hidden_size = layout.hidden_size
         total_rows = sum(window.rows for window in plan)
         # Same split as the wire payload: the broadcast window is one batch.
         embeds, expert_ids, engram_hashes = layout.unpack(dev, total_rows)

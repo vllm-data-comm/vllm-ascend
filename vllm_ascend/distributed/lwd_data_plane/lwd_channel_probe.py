@@ -43,8 +43,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
+from vllm.distributed.lwd.lwd_types import LwdChannelType
 
 __all__ = [
     "LWD_PROBE_TIMEOUT_S",

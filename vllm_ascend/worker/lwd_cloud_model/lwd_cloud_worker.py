@@ -19,24 +19,25 @@ import time
 from typing import TYPE_CHECKING
 
 import torch
-from vllm.distributed.parallel_state import (
-    get_tensor_model_parallel_rank,
-    get_tp_group,
-)
-from vllm.lwd_logger import lwd_logger
-from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
-
-# ops must initialize before the model_runner chain, otherwise device_op
-# and the ops package circularly import (mirrors worker.py's import order)
-import vllm_ascend.ops  # noqa: F401
-from vllm_ascend.distributed.lwd_data_plane.lwd_data_plane import lwd_get_data_plane
-from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
+from vllm.distributed.lwd.lwd_data_plane import lwd_get_data_plane
+from vllm.distributed.lwd.lwd_transfer_future import LwdTransferFuture
+from vllm.distributed.lwd.lwd_types import (
     ConnectionId,
     LwdChannelType,
     LwdTransferRequest,
     connection_from,
 )
+from vllm.distributed.parallel_state import (
+    get_tensor_model_parallel_rank,
+    get_tp_group,
+)
+from vllm.lwd_logger import lwd_logger
+from vllm.v1.lwd_comm.lwd_up_payload import LwdUpPayloadLayout
+from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+
+# ops must initialize before the model_runner chain, otherwise device_op
+# and the ops package circularly import (mirrors worker.py's import order)
+import vllm_ascend.ops  # noqa: F401
 from vllm_ascend.worker.lwd_base_model.lwd_worker_base import LwdWorkerBase
 from vllm_ascend.worker.lwd_cloud_model.lwd_cloud_model_runner import (
     LwdCloudModelRunner,
@@ -45,7 +46,6 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import (
     LwdHostStager,
     LwdHostStageSlotBusy,
 )
-from vllm_ascend.worker.lwd_hash.lwd_up_payload import LwdUpPayloadLayout
 
 if TYPE_CHECKING:
     from typing import Any

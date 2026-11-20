@@ -9,27 +9,22 @@ from typing import cast
 from unittest.mock import Mock, patch
 
 import pytest
-
-pytest.importorskip(
-    "torch",
-    reason="edge runner imports torch; rerun on a host with the training stack",
-)
-
-from vllm.v1.core.sched.output import (  # noqa: E402
+import torch
+from vllm.distributed.lwd.lwd_transfer_future import LwdTransferFuture
+from vllm.distributed.lwd.lwd_types import ConnectionId
+from vllm.v1.core.sched.output import (
     LwdEmbedBatch,
     LwdUnembedBatch,
     SchedulerOutput,
 )
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import (  # noqa: E402
-    LwdTransferFuture,
-)
-from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (  # noqa: E402
+from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (
     LwdEdgeModelRunner,
 )
-from vllm_ascend.worker.lwd_edge_model.lwd_edge_worker import (  # noqa: E402
-    LwdEdgeWorker,
-)
+from vllm_ascend.worker.lwd_edge_model.lwd_edge_worker import LwdEdgeWorker
+
+_DP0 = ConnectionId(0, 0, 0)
+_DP1 = ConnectionId(0, 0, 1)
 
 
 class _FakeFuture:
@@ -61,7 +56,7 @@ def _add_send(
     seqno: int,
     future: _FakeFuture,
 ) -> None:
-    pending = runner._lwd_up_send_inflight.setdefault(dp_idx, deque())
+    pending = runner._lwd_up_send_inflight.setdefault(ConnectionId(0, 0, dp_idx), deque())
     pending.append((seqno, cast(LwdTransferFuture, future)))
 
 
@@ -71,10 +66,10 @@ def test_watermark_advances_across_completed_prefix() -> None:
     for seqno, future in enumerate(futures):
         _add_send(runner, 0, seqno, future)
 
-    assert runner._lwd_watermarked_output(0).lwd_up_send_watermarks == {0: 1}
+    assert runner._lwd_watermarked_output(0).lwd_up_send_watermarks == {_DP0: 1}
 
     futures[2].complete()
-    assert runner._lwd_watermarked_output(0).lwd_up_send_watermarks == {0: 2}
+    assert runner._lwd_watermarked_output(0).lwd_up_send_watermarks == {_DP0: 2}
 
 
 def test_out_of_order_completion_cannot_advance_watermark() -> None:
@@ -83,10 +78,10 @@ def test_out_of_order_completion_cannot_advance_watermark() -> None:
     for seqno, future in enumerate(futures):
         _add_send(runner, 0, seqno, future)
 
-    assert runner._lwd_watermarked_output(0).lwd_up_send_watermarks == {0: -1}
+    assert runner._lwd_watermarked_output(0).lwd_up_send_watermarks == {_DP0: -1}
 
     futures[0].complete()
-    assert runner._lwd_watermarked_output(0).lwd_up_send_watermarks == {0: 2}
+    assert runner._lwd_watermarked_output(0).lwd_up_send_watermarks == {_DP0: 2}
 
 
 def test_same_seqno_is_isolated_and_embed_returns_current_dp() -> None:
@@ -98,11 +93,11 @@ def test_same_seqno_is_isolated_and_embed_returns_current_dp() -> None:
     scheduler_output = cast(SchedulerOutput, SimpleNamespace(scheduled_new_reqs=[]))
 
     with patch.object(runner, "get_model", return_value=None):
-        dp0_output = runner.execute_lwd_embed(0, LwdEmbedBatch(dp_idx=0), scheduler_output)
-        dp1_output = runner.execute_lwd_embed(0, LwdEmbedBatch(dp_idx=1), scheduler_output)
+        dp0_output = runner.execute_lwd_embed(0, LwdEmbedBatch(connection_id=_DP0), scheduler_output)
+        dp1_output = runner.execute_lwd_embed(0, LwdEmbedBatch(connection_id=_DP1), scheduler_output)
 
-    assert dp0_output.lwd_up_send_watermarks == {0: 0}
-    assert dp1_output.lwd_up_send_watermarks == {1: -1}
+    assert dp0_output.lwd_up_send_watermarks == {_DP0: 0}
+    assert dp1_output.lwd_up_send_watermarks == {_DP1: -1}
 
 
 def test_empty_unembed_returns_all_dp_watermarks() -> None:
@@ -111,9 +106,9 @@ def test_empty_unembed_returns_all_dp_watermarks() -> None:
     _add_send(runner, 1, 0, _FakeFuture())
 
     with patch.object(runner, "get_model", return_value=None):
-        output = runner.execute_lwd_unembed(0, LwdUnembedBatch(dp_idx=1))
+        output = runner.execute_lwd_unembed(0, LwdUnembedBatch(connection_id=_DP1))
 
-    assert output.lwd_up_send_watermarks == {0: 0, 1: -1}
+    assert output.lwd_up_send_watermarks == {_DP0: 0, _DP1: -1}
 
 
 @pytest.mark.parametrize(
@@ -135,7 +130,7 @@ def test_worker_step_without_compute_returns_all_dp_watermarks(lwd_batch: object
 
     output = worker.execute_model(scheduler_output)
 
-    assert output.lwd_up_send_watermarks == {0: 0, 1: -1}
+    assert output.lwd_up_send_watermarks == {_DP0: 0, _DP1: -1}
     worker.comm_service.poll_completions.assert_called_once_with()
 
 
@@ -148,4 +143,32 @@ def test_send_error_does_not_pop_or_advance_watermark() -> None:
         runner._lwd_watermarked_output(0)
 
     assert runner._lwd_up_send_watermarks == {}
-    assert [seqno for seqno, _ in runner._lwd_up_send_inflight[0]] == [0]
+    assert [seqno for seqno, _ in runner._lwd_up_send_inflight[_DP0]] == [0]
+
+
+def test_npu_adapter_initializes_npu_base_once() -> None:
+    from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import (
+        LwdBaseModelRunner,
+    )
+
+    config = SimpleNamespace(model_config=SimpleNamespace(get_hidden_size=lambda: 4))
+    device = torch.device("cpu")
+    worker = SimpleNamespace()
+    calls = []
+
+    def fake_npu_init(self, vllm_config, actual_device, worker=None) -> None:
+        calls.append((vllm_config, actual_device, worker))
+        self.model_config = vllm_config.model_config
+
+    with (
+        patch.object(LwdBaseModelRunner, "__init__", fake_npu_init),
+        patch(
+            "vllm.v1.worker.lwd_edge.lwd_edge_gpu_model_runner.LwdEngramHasher.from_model_config",
+            return_value=None,
+        ),
+    ):
+        runner = LwdEdgeModelRunner(config, device, worker)
+
+    assert len(calls) == 1
+    assert calls[0][:2] == (config, device)
+    assert runner.worker is worker

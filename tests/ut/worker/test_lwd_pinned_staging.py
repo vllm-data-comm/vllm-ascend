@@ -25,13 +25,12 @@ import pytest
 torch = pytest.importorskip("torch")
 
 pytestmark = pytest.mark.skipif(
-    not (getattr(torch, "npu", None) or torch.cuda.is_available()),
-    reason="pinned memory needs an accelerator host allocator; "
-    "rerun on the training-stack host",
+    not (torch.npu.is_available() or torch.cuda.is_available()),
+    reason="pinned memory needs an accelerator host allocator; rerun on the training-stack host",
 )
 
 _ROOT = Path(__file__).resolve().parents[3]
-_MODULE = _ROOT / "vllm_ascend/worker/lwd_base_model/lwd_pinned_staging.py"
+_MODULE = _ROOT.parent / "vllm" / "vllm" / "v1" / "lwd_comm" / "lwd_pinned_staging.py"
 _SPEC = importlib.util.spec_from_file_location("lwd_pinned_staging", _MODULE)
 _module = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_module)
@@ -54,7 +53,9 @@ _DEVICE = "npu" if getattr(torch, "npu", None) else "cuda"
 def test_upload_roundtrip_per_step(min_capacity: int, sizes: list[int]) -> None:
     """Read back right after each upload: the view equals this staging."""
     ring = LwdPinnedStaging(
-        dtype=torch.int64, min_capacity=min_capacity, device=_DEVICE,
+        dtype=torch.int64,
+        min_capacity=min_capacity,
+        device=_DEVICE,
     )
     for step, n in enumerate(sizes):
         src = list(range(step * 100, step * 100 + n))

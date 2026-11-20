@@ -10,16 +10,16 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
-
-from vllm_ascend.distributed.lwd_data_plane import lwd_channels
-from vllm_ascend.distributed.lwd_data_plane import lwd_transfer_queue as queue_module
-from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_future import LwdTransferFuture
-from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_queue import LwdTransferQueue
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import (
+from vllm.distributed.lwd.lwd_transfer_future import LwdTransferFuture
+from vllm.distributed.lwd.lwd_types import (
     LwdChannelType,
     LwdTransferRequest,
     LwdTransferStatus,
 )
+
+from vllm_ascend.distributed.lwd_data_plane import lwd_channels
+from vllm_ascend.distributed.lwd_data_plane import lwd_hccl_transfer_queue as queue_module
+from vllm_ascend.distributed.lwd_data_plane.lwd_hccl_transfer_queue import LwdTransferQueue
 
 
 class _FakeEvent:
@@ -92,9 +92,11 @@ def npu_runtime(monkeypatch: pytest.MonkeyPatch) -> _NpuRuntime:
     monkeypatch.setattr(queue_module.torch.npu, "stream", runtime.activate_stream)
     monkeypatch.setattr(queue_module.torch.npu, "current_stream", lambda: runtime.current_stream)
     monkeypatch.setattr(queue_module, "lwd_scramble_seed_for", lambda request: None)
-    monkeypatch.setattr(lwd_channels, "lwd_get_channel_stream", lambda channel, dp_idx: runtime.channel_stream)
-    monkeypatch.setattr(lwd_channels, "lwd_get_channel_device_group", lambda channel, dp_idx: object())
-    monkeypatch.setattr(lwd_channels, "lwd_get_channel_peer", lambda channel, dp_idx: 1)
+    monkeypatch.setattr(
+        lwd_channels, "lwd_get_channel_stream", lambda channel, dp_idx, **kwargs: runtime.channel_stream
+    )
+    monkeypatch.setattr(lwd_channels, "lwd_get_channel_device_group", lambda channel, dp_idx, **kwargs: object())
+    monkeypatch.setattr(lwd_channels, "lwd_get_channel_peer", lambda channel, dp_idx, **kwargs: 1)
     monkeypatch.setattr(queue_module.dist, "get_rank", lambda: 0)
     monkeypatch.setattr(queue_module.dist, "get_process_group_ranks", lambda group: [0, 1])
     monkeypatch.setattr(queue_module.dist, "irecv", runtime.receive)
@@ -161,7 +163,7 @@ def test_d2h_waits_for_post_descramble_event(
     npu_runtime: _NpuRuntime,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    from vllm_ascend.distributed.lwd_data_plane import lwd_payload_scrambler as scrambler_module
+    from vllm.distributed.lwd import lwd_payload_scrambler as scrambler_module
 
     scrambler = MagicMock()
     scrambler.descramble.side_effect = lambda tensor, seed: npu_runtime.operations.append(("descramble", seed))

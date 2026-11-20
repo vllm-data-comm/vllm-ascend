@@ -20,7 +20,7 @@ torch = pytest.importorskip(
     reason="select_token_batch needs torch; rerun on a host with the training stack",
 )
 
-from vllm_ascend.worker.lwd_edge_model.lwd_edge_model_runner import (  # noqa: E402
+from vllm.v1.worker.lwd_edge.lwd_edge_gpu_model_runner import (  # noqa: E402
     select_token_batch,
 )  # noqa: E402
 

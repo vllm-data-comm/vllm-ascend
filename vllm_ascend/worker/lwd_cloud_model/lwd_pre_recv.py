@@ -27,8 +27,9 @@ from collections.abc import Callable, Iterable
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any, NamedTuple
 
+from vllm.distributed.lwd.lwd_types import ConnectionId, LwdChannelType
+
 from vllm_ascend import envs
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdChannelType
 
 if TYPE_CHECKING:
     from vllm.distributed.device_communicators.shm_broadcast import Handle, MessageQueue

@@ -33,7 +33,8 @@ SPEC.loader.exec_module(routing)
 # routing module under it so the plugin __init__ stays out of this file.
 sys.modules.setdefault("vllm_ascend.worker.lwd_hash.lwd_hash_routing", routing)
 _LAYOUT_SPEC = importlib.util.spec_from_file_location(
-    "lwd_up_payload", ROOT / "worker/lwd_hash/lwd_up_payload.py"
+    "lwd_up_payload",
+    ROOT.parent.parent / "vllm/vllm/v1/lwd_comm/lwd_up_payload.py",
 )
 up_payload = importlib.util.module_from_spec(_LAYOUT_SPEC)
 sys.modules["lwd_up_payload"] = up_payload
@@ -182,7 +183,7 @@ def host_request(embeds, ids, consumed):
         recv_rows=prompt_rows,
         consumed=consumed,
         tail_off=tail_off,
-        tail_range_at=lambda base, rows: (
+        tail_range_at=lambda _segment, base, rows: (
             tail_off + base * tail_per_row,
             tail_off + (base + rows) * tail_per_row,
         ),
@@ -256,6 +257,7 @@ class TestCloudPreemption(unittest.TestCase):
             lwd_logger=self.logger,
         )
         self.runner = cls()
+        self.runner.lwd_engram_inputs = None
         self.runner.worker = NS(_lwd_is_early_recv_endpoint=True, _lwd_stager=self.stager)
 
     def output(self, *req_computed):
@@ -428,7 +430,8 @@ class TestMixedInjection(unittest.TestCase):
             extra_classes=("LwdPromptWindow", "LwdUpWindow"),
             time=time,
             lwd_logger=NS(info=lambda *args: None),
-            hash_layer_count=routing.hash_layer_count,
+            hash_layer_count=up_payload.hash_layer_count,
+            lwd_check_image_placeholder_spans=lambda *args: None,
             SchedulerOutput=object,
             SpecDecodeMetadata=object,
             LwdHostStager=object,
@@ -475,6 +478,7 @@ class TestMixedInjection(unittest.TestCase):
             _lwd_up_src_ranks={self.connection: 1},
         )
         self.runner.device = torch.device("cpu")
+        self.runner.lwd_engram_inputs = None
         self.runner.vllm_config = NS(scheduler_config=NS(max_num_batched_tokens=8))
         # `get_hf_text_config` asks the config for its text sub-config; a pure
         # text model answers with itself.
@@ -604,14 +608,16 @@ class TestMixedInjection(unittest.TestCase):
             [[1, 3, 6, 9], [2, 4, 7, 8], [0, 2, 5, 6]],
             dtype=torch.int64,
         )
-        new_req = NS(req_id="a", prompt_len=4, lwd_mrope_positions=positions.numpy().tobytes())
+        new_req = NS(
+            req_id="a", prompt_len=4, lwd_image_placeholder_spans=[], lwd_mrope_positions=positions.numpy().tobytes()
+        )
         self.inject(new_reqs=[new_req])
         self.assertTrue(torch.equal(self.runner.positions_seen_by_base["a"], positions))
         self.assertEqual(self.runner.requests["a"].mrope_position_delta, 6)
         self.assertFalse(self.runner.positions_seen_by_base["b"].any())
 
     def test_full_mrope_rejects_wrong_payload_length(self):
-        new_req = NS(req_id="a", prompt_len=4, lwd_mrope_positions=b"too-short")
+        new_req = NS(req_id="a", prompt_len=4, lwd_image_placeholder_spans=[], lwd_mrope_positions=b"too-short")
         with self.assertRaisesRegex(RuntimeError, "payload bytes"):
             self.inject(new_reqs=[new_req])
 
@@ -638,7 +644,9 @@ class TestMixedInjection(unittest.TestCase):
             return NS(wait=lambda: broadcasts.append(("wait", tensor.numel())))
 
         positions = torch.arange(12, dtype=torch.int64).view(3, 4)
-        new_req = NS(req_id="a", prompt_len=4, lwd_mrope_positions=positions.numpy().tobytes())
+        new_req = NS(
+            req_id="a", prompt_len=4, lwd_image_placeholder_spans=[], lwd_mrope_positions=positions.numpy().tobytes()
+        )
         with (
             patch.object(torch, "empty", side_effect=allocate),
             patch("torch.distributed.broadcast", side_effect=broadcast),
@@ -653,13 +661,10 @@ class TestMixedInjection(unittest.TestCase):
         self.assertTrue(torch.equal(self.runner.positions_seen_by_base["a"], positions))
 
 
-class TestExternalEmbeddingSP(unittest.TestCase):
-    def test_main_and_mtp_shard_only_embedding_rows(self):
+class TestExternalEmbeddingInputs(unittest.TestCase):
+    def test_main_passes_positions_and_external_embeddings_unchanged(self):
         class Base:
             def _model_forward(self, *args, **kwargs):
-                return args
-
-            def _run_merged_draft(self, *args):
                 return args
 
         context = NS(flash_comm_v1_enabled=True, pad_size=1)
@@ -668,21 +673,12 @@ class TestExternalEmbeddingSP(unittest.TestCase):
         main = load_methods(RUNNER, {"_model_forward"}, Base, **globals_)()
         main.supports_mm_inputs = False
         main.lwd_hash_state = None
-        mtp = load_methods("worker/lwd_cloud_model/lwd_mtp_proposer.py", {"_run_merged_draft"}, Base, **globals_)()
-        mtp.is_multimodal_model = False
+        main.lwd_engram_inputs = None
         embeds = torch.arange(6).reshape(3, 2).float()
         positions = torch.arange(3)
         main_result = main._model_forward(3, positions=positions, inputs_embeds=embeds)
-        mtp_result = mtp._run_merged_draft(3, 1, None, positions, embeds, None, 3)
-        expected = torch.tensor([[4.0, 5.0], [0.0, 0.0]])
-        self.assertTrue(torch.equal(main_result[4], expected))
-        self.assertTrue(torch.equal(mtp_result[4], expected))
         self.assertIs(main_result[2], positions)
-        self.assertIs(mtp_result[3], positions)
-        with self.assertRaisesRegex(ValueError, "full-token"):
-            main._model_forward(3, inputs_embeds=embeds[:2])
-        with self.assertRaisesRegex(ValueError, "full-token"):
-            mtp._run_merged_draft(3, 1, None, positions, embeds[:2], None, 3)
+        self.assertIs(main_result[4], embeds)
 
 
 class TestDrafterRouting(unittest.TestCase):
@@ -715,6 +711,7 @@ class TestDrafterRouting(unittest.TestCase):
         )
         runner = runner_cls()
         runner.vllm_config = NS(lwd_config=lwd_config)
+        runner.device = torch.device("cpu")
         runner.speculative_config = NS(method=method, use_step3p5_mtp=lambda: step35)
         return runner._get_drafter(), built
 

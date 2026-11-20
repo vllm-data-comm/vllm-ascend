@@ -14,12 +14,11 @@ present) plus the shared data-plane handle.
 
 from __future__ import annotations
 
-from vllm_ascend.distributed.lwd_data_plane.lwd_data_plane import (
+from vllm.distributed.lwd.lwd_data_plane import (
     lwd_get_data_plane,
+    lwd_init_payload_scrambler,
 )
-from vllm_ascend.distributed.lwd_data_plane.lwd_payload_scrambler import (
-    lwd_get_payload_scrambler,
-)
+
 from vllm_ascend.worker.worker import NPUWorker
 
 
@@ -35,19 +34,7 @@ class LwdWorkerBase(NPUWorker):
 
     def _init_payload_scrambler(self) -> None:
         """Bind the process-wide scrambler when feature_ctrl enables it."""
-        lwd_config = getattr(self.vllm_config, "lwd_config", None)
-        if lwd_config is None:
-            return
-        features = lwd_config.topology.feature_ctrl
-        scramble = getattr(features, "scramble", None)
-        if scramble is None or not scramble.enable:
-            return
-        if not scramble.device_id or not scramble.custom_factor:
-            raise ValueError("[LWD] feature_ctrl.scramble.enable requires both device_id and custom_factor")
-        lwd_get_payload_scrambler(
-            device_id=scramble.device_id,
-            custom_factor=scramble.custom_factor,
-        )
+        lwd_init_payload_scrambler(self.vllm_config.lwd_config)
 
     def _init_lwd_data_plane(self) -> None:
         # The data-plane channels MUST be built here, never in ``__init__``.

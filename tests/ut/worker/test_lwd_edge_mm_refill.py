@@ -10,8 +10,9 @@ import pytest
 import torch
 
 ROOT = Path(__file__).resolve().parents[3] / "vllm_ascend"
-CACHE_PATH = ROOT / "worker/lwd_edge_model/lwd_edge_mm_cache.py"
-RUNNER_PATH = ROOT / "worker/lwd_edge_model/lwd_edge_model_runner.py"
+VLLM_ROOT = ROOT.parent.parent / "vllm" / "vllm"
+CACHE_PATH = VLLM_ROOT / "v1/worker/lwd_edge/lwd_edge_mm_cache.py"
+RUNNER_PATH = VLLM_ROOT / "v1/worker/lwd_edge/lwd_edge_gpu_model_runner.py"
 
 
 def _load_class(path: Path, class_name: str, methods: set[str] | None = None) -> type:
@@ -33,7 +34,7 @@ def _load_class(path: Path, class_name: str, methods: set[str] | None = None) ->
 
 
 _CACHE_CLS = _load_class(CACHE_PATH, "LwdEdgeMmCache")
-_RUNNER_CLS = _load_class(RUNNER_PATH, "LwdEdgeModelRunner", {"_lwd_gather_mm"})
+_RUNNER_CLS = _load_class(RUNNER_PATH, "LwdEdgeGPUModelRunner", {"_lwd_gather_mm"})
 
 
 def _feature(identifier: str, offset: int, length: int, data: object = None) -> object:

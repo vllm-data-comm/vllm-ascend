@@ -27,12 +27,11 @@ from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 import torch
-
 from vllm.lwd_logger import lwd_logger
+from vllm.v1.lwd_comm.lwd_up_payload import lwd_engram_payload_dims
 
 from vllm_ascend.ops.fused_moe.router.fused_topk_router import DEEPSEEK_V4_IMAGE_SENTINEL_COUNT
 from vllm_ascend.worker.lwd_cloud_model.lwd_embed_lookup import LWD_NO_EMBED_ROW, LwdEmbedLookup
-from vllm_ascend.worker.lwd_hash.lwd_up_payload import lwd_engram_payload_dims
 
 if TYPE_CHECKING:
     from torch import nn

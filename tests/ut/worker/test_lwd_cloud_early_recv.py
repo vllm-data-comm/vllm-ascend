@@ -32,7 +32,7 @@ def load_module(name: str, path: Path, modules: dict[str, types.ModuleType] | No
 
 lwd_types = load_module(
     "lwd_types_for_cloud_early_recv_test",
-    ROOT / "vllm_ascend/distributed/lwd_data_plane/lwd_types.py",
+    ROOT.parent / "vllm" / "vllm" / "distributed/lwd/lwd_types.py",
 )
 envs = load_module("envs_for_cloud_early_recv_test", ROOT / "vllm_ascend/envs.py")
 parents = {
@@ -49,7 +49,7 @@ pre_recv = load_module(
     {
         **parents,
         "vllm_ascend.envs": envs,
-        "vllm_ascend.distributed.lwd_data_plane.lwd_types": lwd_types,
+        "vllm.distributed.lwd.lwd_types": lwd_types,
     },
 )
 fake_vllm = types.ModuleType("vllm")
@@ -68,17 +68,14 @@ fake_routing = types.ModuleType("vllm_ascend.worker.lwd_hash.lwd_hash_routing")
 fake_routing.hash_layer_count = lambda hf_config: getattr(hf_config, "num_hash_layers", 0)
 up_payload = load_module(
     "lwd_up_payload_for_cloud_early_recv_test",
-    ROOT / "vllm_ascend/worker/lwd_hash/lwd_up_payload.py",
+    ROOT.parent / "vllm/vllm/v1/lwd_comm/lwd_up_payload.py",
     {
         "torch": types.ModuleType("torch"),
         "vllm": fake_vllm,
         "vllm.transformers_utils": types.ModuleType("vllm.transformers_utils"),
         "vllm.transformers_utils.config": fake_hf_config_module,
         "vllm_ascend.worker.lwd_hash.lwd_hash_routing": fake_routing,
-        **{
-            name: types.ModuleType(name)
-            for name in ("vllm_ascend.worker", "vllm_ascend.worker.lwd_hash")
-        },
+        **{name: types.ModuleType(name) for name in ("vllm_ascend.worker", "vllm_ascend.worker.lwd_hash")},
     },
 )
 

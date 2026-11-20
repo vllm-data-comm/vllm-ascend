@@ -20,9 +20,8 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
+from vllm.distributed.lwd.lwd_types import ConnectionId
 from vllm.lwd_logger import lwd_logger
-
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId
 
 LwdStageKey = int | tuple[ConnectionId, int]
 
@@ -548,8 +547,7 @@ class LwdHostStager:
             raise LwdHostStageGeometryError(f"req={req_id}: not staged")
         start, end = req.read_range(n_rows)
         tail_starts = tuple(
-            req.tail_range(index, n_rows)[0] if per_row else -1
-            for index, per_row in enumerate(req.tail_sizes)
+            req.tail_range(index, n_rows)[0] if per_row else -1 for index, per_row in enumerate(req.tail_sizes)
         )
         return start, end - start, tail_starts
 
@@ -717,11 +715,7 @@ class LwdHostStager:
             self._host_bytes += (host.numel + host.tail_numel) * 2
             if offset > 0:
                 host.seed_prefix(offset)
-        elif (
-            host.prompt_rows != prompt_rows
-            or host.hidden_size != hidden_size
-            or host.tail_sizes != tail_sizes
-        ):
+        elif host.prompt_rows != prompt_rows or host.hidden_size != hidden_size or host.tail_sizes != tail_sizes:
             raise LwdHostStageGeometryError(f"req={req_id}: later chunk geometry differs from the first chunk")
         else:
             if host.prefix_nonce != prefix_nonce:

@@ -33,8 +33,7 @@ from pathlib import Path
 
 import pytest
 import torch
-
-from vllm_ascend.distributed.lwd_data_plane import lwd_payload_scrambler as ps
+import vllm.distributed.lwd.lwd_payload_scrambler as ps
 
 _FACTORS = {
     "device_id": "ECPAIR-SN-8A3F91",

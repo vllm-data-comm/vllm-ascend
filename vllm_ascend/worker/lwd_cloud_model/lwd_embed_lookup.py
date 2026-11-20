@@ -25,7 +25,6 @@ import random
 
 import torch
 import torch.distributed as dist
-
 from vllm.lwd_logger import lwd_logger
 
 LWD_NO_EMBED_ROW = -1

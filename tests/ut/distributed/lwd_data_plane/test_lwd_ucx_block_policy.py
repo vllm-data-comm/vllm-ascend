@@ -10,10 +10,11 @@ from pathlib import Path
 import pytest
 
 _POLICY = (
-    Path(__file__).resolve().parents[4]
-    / "vllm_ascend"
+    Path(__file__).resolve().parents[4].parent
+    / "vllm"
+    / "vllm"
     / "distributed"
-    / "lwd_data_plane"
+    / "lwd"
     / "host"
     / "ucx_block_policy.py"
 )

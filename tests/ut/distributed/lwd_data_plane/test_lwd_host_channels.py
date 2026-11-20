@@ -13,9 +13,8 @@ from typing import Any
 
 import pytest
 from vllm.config.lwd import LwdConfig, LwdTopology
-
-from vllm_ascend.distributed.lwd_data_plane.host import lwd_host_channels
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import LwdChannelType
+from vllm.distributed.lwd.host import lwd_host_channels
+from vllm.distributed.lwd.lwd_types import LwdChannelType
 
 CLOUD_ADDR = "10.1.0.1"
 CLOUD_DATA_PORT = 7000
@@ -152,12 +151,11 @@ def _host_bootstrap(monkeypatch) -> None:
     monkeypatch.setattr(lwd_host_channels, "_UCX_LISTENERS", {})
     monkeypatch.setattr(lwd_host_channels, "_UCX_CHANNELS_INITIALIZED", False)
     monkeypatch.setattr(lwd_host_channels, "LwdUcxListener", _Listener)
-    monkeypatch.setattr(lwd_host_channels, "LwdNpuUcxChannelIo", _Io)
+    monkeypatch.setattr(lwd_host_channels, "LwdBaseUcxChannelIo", _Io)
     monkeypatch.setattr(
         lwd_host_channels.torch,
-        "npu",
-        SimpleNamespace(Stream=lambda **_: object()),
-        raising=False,
+        "Stream",
+        lambda **_: object(),
     )
     monkeypatch.setattr(lwd_host_channels, "_resolve_up_block_mb", lambda: 8)
     monkeypatch.setattr(
@@ -171,7 +169,10 @@ def _init(monkeypatch, config: LwdConfig, *, dp_identity: tuple[int, int] = (0, 
     monkeypatch.setattr(
         lwd_host_channels,
         "get_current_vllm_config",
-        lambda: SimpleNamespace(lwd_config=config),
+        lambda: SimpleNamespace(
+            lwd_config=config,
+            device_config=SimpleNamespace(device="cpu"),
+        ),
     )
     monkeypatch.setattr(lwd_host_channels, "_my_dp_identity", lambda: dp_identity)
     lwd_host_channels.lwd_init_host_channels()

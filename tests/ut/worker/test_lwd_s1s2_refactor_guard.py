@@ -113,11 +113,11 @@ def test_pinned_staging_single_implementation() -> None:
     base = (_REPO_ROOT / "vllm_ascend/worker/lwd_base_model/lwd_base_model_runner.py").read_text(encoding="utf-8")
     assert base.count("LwdPinnedStaging(") == 1  # the named lazy factory is the sole constructor
     assert runner.count("LwdPinnedStaging(") == 0  # the cloud delegates via _lwd_staging
-    assert runner.count("self._lwd_staging(") == 1  # down_index only; meta harvest lives on the output thread
+    assert runner.count("self._lwd_staging(") == 2  # down_index + Engram windows
     assert '"down_index"' in runner
     assert '"down_meta"' not in runner
     assert edge.count("LwdPinnedStaging(") == 0  # the edge worker is pure dispatch
-    edge_runner_path = _REPO_ROOT / "vllm_ascend/worker/lwd_edge_model/lwd_edge_model_runner.py"
+    edge_runner_path = _REPO_ROOT.parent / "vllm/vllm/v1/worker/lwd_edge/lwd_edge_gpu_model_runner.py"
     edge_runner = edge_runner_path.read_text(encoding="utf-8")
     assert edge_runner.count("self._lwd_staging(") == 1  # ids staging goes through the factory
     for stale in ("_lwd_pinned_ring_idx", "_lwd_h2d_ring_idx"):

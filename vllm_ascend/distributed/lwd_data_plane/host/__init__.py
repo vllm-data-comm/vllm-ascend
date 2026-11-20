@@ -15,7 +15,7 @@ pure Python ctypes over libucp), and this package assembles it for NPU:
     + D2H/H2D orchestration, block auto-sizing).
 """
 
-from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import (
+from vllm.distributed.lwd.host.lwd_host_channels import (
     lwd_data_plane_comm,
     lwd_data_plane_is_host,
     lwd_destroy_host_channels,
@@ -24,7 +24,7 @@ from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import (
     lwd_init_host_channels,
     lwd_warm_up_host_channels,
 )
-from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_transfer_queue import (
+from vllm.distributed.lwd.host.lwd_host_transfer_queue import (
     LwdHostTransferQueue,
 )
 

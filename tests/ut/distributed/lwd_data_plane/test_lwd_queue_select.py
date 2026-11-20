@@ -12,15 +12,15 @@ from __future__ import annotations
 import sys
 
 import pytest
-
-from vllm_ascend.distributed.lwd_data_plane import lwd_data_plane as plane
-from vllm_ascend.distributed.lwd_data_plane.host import lwd_host_channels
-from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_transfer_queue import (
+from vllm.distributed.lwd.host import lwd_host_channels
+from vllm.distributed.lwd.host.lwd_host_transfer_queue import (
     LwdHostTransferQueue,
 )
-from vllm_ascend.distributed.lwd_data_plane.lwd_transfer_queue import LwdTransferQueue
 
-HOST_QUEUE_MODULE = "vllm_ascend.distributed.lwd_data_plane.host.lwd_host_transfer_queue"
+from vllm_ascend.distributed.lwd_data_plane import lwd_data_plane as plane
+from vllm_ascend.distributed.lwd_data_plane.lwd_hccl_transfer_queue import LwdTransferQueue
+
+HOST_QUEUE_MODULE = "vllm.distributed.lwd.host.lwd_host_transfer_queue"
 
 
 def test_device_transport_keeps_the_hccl_queue(monkeypatch) -> None:

@@ -572,7 +572,7 @@ class Glm5NextModel(nn.Module):
             sparse_topk_block_n = 128
             buffer_width = ((buffer_width + sparse_topk_block_n - 1) // sparse_topk_block_n) * sparse_topk_block_n
             if lwd_role() == "edge":
-                # The edge owns no decoder layers (make_layers LWD branch),
+                # The edge owns no decoder layers in the dedicated edge builder.
                 # so the sparse-indexer top-k buffer would never be read.
                 topk_indices_buffer = None
             else:

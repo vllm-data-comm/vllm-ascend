@@ -8,6 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import numpy as np
 import torch
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -22,10 +23,10 @@ class TestHashDecodeStaging(unittest.TestCase):
     def setUpClass(cls):
         # Import the actual method without loading the NPU plugin.
         path = ROOT / "vllm_ascend/worker/lwd_cloud_model/lwd_cloud_model_runner.py"
-        tree = ast.parse(path.read_text())
-        runner = next(n for n in tree.body if isinstance(n, ast.ClassDef))
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        runner = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "LwdCloudModelRunner")
         method = next(n for n in runner.body if isinstance(n, ast.FunctionDef) and n.name == "_lwd_prepare_hash_batch")
-        ns = {}
+        ns = {"np": np, "torch": torch}
         exec(compile(ast.Module(body=[method], type_ignores=[]), str(path), "exec"), ns)
         cls.prepare = staticmethod(ns[method.name])
 

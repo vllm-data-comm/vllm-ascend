@@ -4,12 +4,10 @@
 from __future__ import annotations
 
 import queue
-from types import SimpleNamespace
 
 import pytest
-
-from vllm_ascend.distributed.lwd_data_plane.host import ucx_io
-from vllm_ascend.distributed.lwd_data_plane.host.ucx_io import LwdNpuUcxChannelIo
+from vllm.distributed.lwd.host import ucx_io
+from vllm.distributed.lwd.host.ucx_io import LwdBaseUcxChannelIo
 
 
 class _Stream:
@@ -33,8 +31,7 @@ class _RecordingQueue(queue.Queue):
 @pytest.fixture(autouse=True)
 def producer_stream(monkeypatch):
     producer = object()
-    npu = SimpleNamespace(current_stream=lambda: producer)
-    monkeypatch.setattr(ucx_io.torch, "npu", npu, raising=False)
+    monkeypatch.setattr(ucx_io.torch.accelerator, "current_stream", lambda: producer, raising=False)
     return producer
 
 
@@ -55,7 +52,7 @@ class _Future:
 
 
 def _send_io(block_bytes: int, env: str):
-    io = object.__new__(LwdNpuUcxChannelIo)
+    io = object.__new__(LwdBaseUcxChannelIo)
     io.tag = "lwd_up/send"
     io._tr_submit_send = False
     io._block_bytes = block_bytes
@@ -106,14 +103,15 @@ def test_early_frame_capacity_is_passed_to_the_transport(monkeypatch) -> None:
 
     monkeypatch.setattr(ucx_io, "LwdUcxConfig", Config)
     monkeypatch.setattr(ucx_io, "open_transport", lambda *args, **kwargs: object())
-    monkeypatch.setattr(ucx_io.torch.npu, "Stream", lambda: object(), raising=False)
-    config = ucx_io.LwdNpuUcxChannelIoConfig(
+    monkeypatch.setattr(ucx_io.torch, "Stream", lambda **kwargs: object())
+    config = ucx_io.LwdUcxChannelIoConfig(
         op="recv",
+        device=ucx_io.torch.device("cpu"),
         up_block_mb=128,
         down_block_mb=32,
         token=1,
     )
 
-    ucx_io.LwdNpuUcxChannelIo(ucx_io.LwdChannelType.UP, object(), config)
+    ucx_io.LwdBaseUcxChannelIo(ucx_io.LwdChannelType.UP, object(), config)
 
     assert captured["early_max"] == 4096

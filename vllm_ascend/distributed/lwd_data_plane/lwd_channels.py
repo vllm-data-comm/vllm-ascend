@@ -30,6 +30,7 @@ import torch
 import torch.distributed as dist
 from vllm.config import get_current_vllm_config
 from vllm.distributed.lwd import LwdChannelEndpoints, LwdParallelGroupsSpec
+from vllm.distributed.lwd.lwd_types import ConnectionId, LwdChannelType
 from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import logger
 
@@ -40,7 +41,9 @@ from vllm_ascend.distributed.lwd_data_plane.lwd_channel_probe import (
     lwd_probe_verify,
     lwd_probe_wait,
 )
-from vllm_ascend.distributed.lwd_data_plane.lwd_types import ConnectionId, LwdChannelType
+from vllm_ascend.distributed.lwd_data_plane.lwd_data_plane import (
+    lwd_init_data_plane_backend,
+)
 
 # (connection, channel) -> (device_group, peer_global_rank), endpoint ranks only
 _LWD_CHANNEL_GROUPS: dict[tuple[ConnectionId, LwdChannelType], tuple[dist.ProcessGroup, int]] = {}
@@ -68,18 +71,20 @@ def lwd_init_channels() -> None:
     # LwdTransferQueue implementation). Lazy import keeps the UCX stack
     # (libucp ctypes) out of the default HCCL path. The HCCL channel probe
     # below is device-only: host comm has no HCCL channel to probe.
-    from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import (
+    from vllm.distributed.lwd.host.lwd_host_channels import (
         lwd_data_plane_comm,
     )
 
     if lwd_data_plane_comm() == "host":  # caches the comm for the request path
-        from vllm_ascend.distributed.lwd_data_plane.host import (
+        from vllm.distributed.lwd.host.lwd_host_channels import (
             lwd_init_host_channels,
         )
 
         lwd_init_host_channels()
+        lwd_init_data_plane_backend()
         _LWD_CHANNELS_INITIALIZED = True
         return
+    lwd_init_data_plane_backend()
     spec = LwdParallelGroupsSpec.from_topology(lwd_config.topology)
     backend = dist.get_backend(get_world_group().device_group)
     my_rank = dist.get_rank()
@@ -315,13 +320,13 @@ def lwd_get_channel_stream(
 
 def lwd_destroy_channels() -> None:
     global _LWD_CHANNELS_INITIALIZED, _LWD_ENDPOINTS
-    from vllm_ascend.distributed.lwd_data_plane.host.lwd_host_channels import (
+    from vllm.distributed.lwd.host.lwd_host_channels import (
         lwd_data_plane_comm,
     )
 
     if _LWD_CHANNELS_INITIALIZED and lwd_data_plane_comm() == "host":
         # Host comm: no HCCL groups exist; tear down the host links.
-        from vllm_ascend.distributed.lwd_data_plane.host import (
+        from vllm.distributed.lwd.host.lwd_host_channels import (
             lwd_destroy_host_channels,
         )
 
