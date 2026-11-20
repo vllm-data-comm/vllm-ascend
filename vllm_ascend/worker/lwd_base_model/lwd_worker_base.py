@@ -34,7 +34,11 @@ class LwdWorkerBase(NPUWorker):
         self.comm_service = lwd_get_data_plane()
 
     def _init_payload_scrambler(self) -> None:
-        """Bind the process-wide scrambler when feature_ctrl enables it."""
+        """Bind the process-wide scrambler when feature_ctrl enables it.
+
+        The config check already rejected an enabled scramble that misses its
+        two factors, so this only forwards the parsed values.
+        """
         lwd_config = getattr(self.vllm_config, "lwd_config", None)
         if lwd_config is None:
             return
@@ -42,8 +46,6 @@ class LwdWorkerBase(NPUWorker):
         scramble = getattr(features, "scramble", None)
         if scramble is None or not scramble.enable:
             return
-        if not scramble.device_id or not scramble.custom_factor:
-            raise ValueError("[LWD] feature_ctrl.scramble.enable requires both device_id and custom_factor")
         lwd_get_payload_scrambler(
             device_id=scramble.device_id,
             custom_factor=scramble.custom_factor,
