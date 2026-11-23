@@ -1206,7 +1206,27 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 self.discard_request_mask.np.copy(),
             )
         self._lwd_captured_sampler_output = None
+        scheduler_output = (
+            self.execute_model_state[0]
+            if self.execute_model_state is not None
+            else None
+        )
+        scheduled = (
+            scheduler_output.num_scheduled_tokens
+            if scheduler_output is not None
+            else {}
+        )
+        lwd_logger.info(
+            "[LWD][sample] enter dp=%d scheduled=%s",
+            self.parallel_config.data_parallel_rank,
+            scheduled,
+        )
         output = super().sample_tokens(grammar_output)
+        lwd_logger.info(
+            "[LWD][sample] exit dp=%d scheduled=%s",
+            self.parallel_config.data_parallel_rank,
+            scheduled,
+        )
         if captured is not None and self._lwd_captured_sampler_output is not None:
             payload = self._lwd_collect_down_payload(
                 captured[0],

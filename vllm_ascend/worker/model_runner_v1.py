@@ -53,6 +53,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.forward_context import BatchDescriptor, ForwardContext, get_forward_context
 from vllm.logger import logger
+from vllm.lwd_logger import lwd_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.mamba.abstract import MambaBase
 from vllm.model_executor.model_loader import get_model
@@ -842,7 +843,21 @@ class NPUModelRunner(GPUModelRunner):
         packed_tensor = torch.zeros(2, self.dp_size, device="cpu", dtype=torch.int32)
         packed_tensor[0][self.dp_rank] = num_tokens
         packed_tensor[1][self.dp_rank] = cudagraph_mode.value
+        if self.vllm_config.lwd_config is not None:
+            lwd_logger.info(
+                "[LWD][dp-sync] enter dp=%d draft=%s tokens=%d",
+                self.dp_rank,
+                is_draft_model,
+                num_tokens,
+            )
         dist.all_reduce(packed_tensor, group=get_dp_group().cpu_group)
+        if self.vllm_config.lwd_config is not None:
+            lwd_logger.info(
+                "[LWD][dp-sync] exit dp=%d draft=%s tokens_across=%s",
+                self.dp_rank,
+                is_draft_model,
+                packed_tensor[0, :].tolist(),
+            )
 
         # Unpack the results
         num_tokens_across_dp = packed_tensor[0, :]
@@ -2592,9 +2607,22 @@ class NPUModelRunner(GPUModelRunner):
                 if mamba_copy_connector is None:
                     mamba_utils.do_mamba_copy_block(preprocess_bufs)
             self._restore_c8_mxfp_loaded_v_scales(scheduler_output)
+            if self.vllm_config.lwd_config is not None:
+                lwd_logger.info(
+                    "[LWD][target] forward enter dp=%d scheduled=%s padded=%d",
+                    self.dp_rank,
+                    scheduler_output.num_scheduled_tokens,
+                    num_tokens_padded,
+                )
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if self.vllm_config.lwd_config is not None:
+                lwd_logger.info(
+                    "[LWD][target] forward exit dp=%d scheduled=%s",
+                    self.dp_rank,
+                    scheduler_output.num_scheduled_tokens,
+                )
             self._cpp_execution_time_ms = _finish_profiling_chunk_timing(
                 profiling_chunk_config,
                 execution_start_time,
