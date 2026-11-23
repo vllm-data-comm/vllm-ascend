@@ -93,12 +93,27 @@ def lwd_trace_down_packet(
     from vllm.lwd_logger import lwd_logger as log
 
     log.info(
-        "[down-trace] side=%s step=%d seqno=%d req_ids=%s %s",
+        "[down-trace] side=%s step=%d seqno=%d req_ids=%s %s ptr=%s",
         side,
         step,
         seqno,
         req_ids,
         lwd_tensor_checksum("hidden", hidden_states),
+        hex(hidden_states.data_ptr()),
+    )
+
+
+def lwd_trace_hccl_send(request: Any) -> None:
+    """Log the communication-owned snapshot immediately before HCCL isend."""
+    if not lwd_layer_trace_enabled():
+        return
+    from vllm.lwd_logger import lwd_logger as log
+
+    log.info(
+        "[hccl-send] seqno=%s ptr=%s %s",
+        request.seqno,
+        hex(request.tensor.data_ptr()),
+        lwd_tensor_checksum("hidden", request.tensor),
     )
 
 
