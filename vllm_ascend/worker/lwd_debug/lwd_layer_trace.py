@@ -76,6 +76,32 @@ def lwd_trace_replay(
     )
 
 
+def lwd_trace_down_packet(
+    *,
+    side: str,
+    seqno: int,
+    hidden_states: torch.Tensor,
+    req_ids: list[str],
+) -> None:
+    """Log the actual DOWN payload at both ends of one sequence number."""
+    if not lwd_layer_trace_enabled():
+        return
+    step = _replay_steps.get(f"down-{side}", 0) + 1
+    _replay_steps[f"down-{side}"] = step
+    if step > _MAX_REPLAY_BATCHES:
+        return
+    from vllm.lwd_logger import lwd_logger as log
+
+    log.info(
+        "[down-trace] side=%s step=%d seqno=%d req_ids=%s %s",
+        side,
+        step,
+        seqno,
+        req_ids,
+        lwd_tensor_checksum("hidden", hidden_states),
+    )
+
+
 def lwd_tensor_checksum(tag: str, tensor: Any) -> str:
     """One-line tensor checksum description; non-tensors and empty tensors return a placeholder."""
     if tensor is None:

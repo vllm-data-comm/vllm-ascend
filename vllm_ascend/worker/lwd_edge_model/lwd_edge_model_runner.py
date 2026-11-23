@@ -12,7 +12,10 @@ from vllm.v1.worker.lwd_edge.lwd_edge_gpu_model_runner import (
 from vllm_ascend.worker.lwd_base_model.lwd_base_model_runner import (
     LwdBaseModelRunner,
 )
-from vllm_ascend.worker.lwd_debug.lwd_layer_trace import lwd_trace_replay
+from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (
+    lwd_trace_down_packet,
+    lwd_trace_replay,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -36,7 +39,15 @@ class LwdEdgeModelRunner(LwdEdgeGPUModelRunner, LwdBaseModelRunner):
         selected_ids: list[int],
         ranks: list[int],
         req_ids: list[str],
+        hidden_states: torch.Tensor | None = None,
     ) -> None:
+        if hidden_states is not None:
+            lwd_trace_down_packet(
+                side="edge",
+                seqno=seqno,
+                hidden_states=hidden_states,
+                req_ids=req_ids,
+            )
         lwd_trace_replay(
             side="edge",
             logits=logits,
