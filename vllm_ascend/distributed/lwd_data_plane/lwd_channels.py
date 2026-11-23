@@ -159,29 +159,31 @@ def _lwd_probe_channel(
         raise RuntimeError(f"channel group backend must be hccl, got {backend}")
     my_rank = dist.get_rank()
     dp_idx = connection.dp_idx
-    if is_sender:
-        # The frame is the identity proof; the sender only needs the op done.
-        payload = lwd_probe_frame(my_rank, dp_idx, channel)
-        handle = dist.isend(payload, dst=peer, group=group)
+    stream = _LWD_CHANNEL_STREAMS[(connection, channel)]
+    with torch.npu.stream(stream):
+        if is_sender:
+            # The frame is the identity proof; the sender only needs the op done.
+            payload = lwd_probe_frame(my_rank, dp_idx, channel)
+            handle = dist.isend(payload, dst=peer, group=group)
+            if not lwd_probe_wait(handle):
+                return _ChannelProbeResult(_ProbeOutcome.TIMEOUT, _lwd_probe_timeout_detail(connection, channel, peer))
+            return _ChannelProbeResult(_ProbeOutcome.OK)
+        # Zero-filled buffer: a no-op irecv or a stale frame fails the [0] magic
+        # check (magic is 90, so an all-zero frame is never a legal one).
+        payload = torch.zeros_like(lwd_probe_frame(peer, dp_idx, channel))
+        handle = dist.irecv(payload, src=peer, group=group)
         if not lwd_probe_wait(handle):
             return _ChannelProbeResult(_ProbeOutcome.TIMEOUT, _lwd_probe_timeout_detail(connection, channel, peer))
+        # The poll above only observed completion; the CPU must sync before
+        # reading the received buffer.
+        torch.npu.synchronize()
+        problem = lwd_probe_verify(payload, peer, dp_idx, channel)
+        if problem:
+            return _ChannelProbeResult(
+                _ProbeOutcome.MISMATCH,
+                f"[connection={connection} channel={channel.value}] frame mismatch (peer={peer}): {problem}",
+            )
         return _ChannelProbeResult(_ProbeOutcome.OK)
-    # Zero-filled buffer: a no-op irecv or a stale frame fails the [0] magic
-    # check (magic is 90, so an all-zero frame is never a legal one).
-    payload = torch.zeros_like(lwd_probe_frame(peer, dp_idx, channel))
-    handle = dist.irecv(payload, src=peer, group=group)
-    if not lwd_probe_wait(handle):
-        return _ChannelProbeResult(_ProbeOutcome.TIMEOUT, _lwd_probe_timeout_detail(connection, channel, peer))
-    # The poll above only observed completion; the CPU must sync before
-    # reading the received buffer.
-    torch.npu.synchronize()
-    problem = lwd_probe_verify(payload, peer, dp_idx, channel)
-    if problem:
-        return _ChannelProbeResult(
-            _ProbeOutcome.MISMATCH,
-            f"[connection={connection} channel={channel.value}] frame mismatch (peer={peer}): {problem}",
-        )
-    return _ChannelProbeResult(_ProbeOutcome.OK)
 
 
 def lwd_warm_up_channels() -> None:
