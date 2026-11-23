@@ -111,6 +111,8 @@ def _make_hook(label: str) -> Callable[..., None]:
         inputs: "tuple[torch.Tensor, ...]",
         output: "torch.Tensor | tuple[torch.Tensor, ...]",
     ) -> None:
+        if torch.compiler.is_compiling():
+            return
         if _state["step"] > _MAX_STEPS:
             return
         log.info(
@@ -128,6 +130,8 @@ def _make_step_hook() -> Callable[..., None]:
     from vllm.lwd_logger import lwd_logger as log
 
     def pre_hook(module: "torch.nn.Module", args: "tuple[torch.Tensor, ...]") -> None:
+        if torch.compiler.is_compiling():
+            return
         _state["step"] += 1
         if _state["step"] <= _MAX_STEPS:
             log.info("[layer-trace] ==== forward step=%d ====", _state["step"])

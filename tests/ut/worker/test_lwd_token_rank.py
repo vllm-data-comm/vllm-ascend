@@ -19,8 +19,45 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import (  # noqa: E402
     LwdTokenRankEncoder,
 )
 from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (  # noqa: E402
+    install_lwd_layer_trace,
     lwd_trace_replay,
 )
+
+
+def test_layer_trace_skips_debug_tensor_reads_during_compilation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Backbone(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.embed_tokens = torch.nn.Embedding(4, 2)
+            self.layers = torch.nn.ModuleList([torch.nn.Identity()])
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            hidden = self.embed_tokens(input_ids)
+            for layer in self.layers:
+                hidden = layer(hidden)
+            return hidden
+
+    class Model(torch.nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.model = Backbone()
+            self.lm_head = torch.nn.Linear(2, 4, bias=False)
+
+        def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+            return self.lm_head(self.model(input_ids))
+
+    monkeypatch.setenv("VLLM_ASCEND_LWD_LAYER_TRACE", "1")
+    model = Model()
+    install_lwd_layer_trace(model)
+    input_ids = torch.tensor([[1, 2]])
+    expected = model(input_ids)
+
+    compiled = torch.compile(model, backend="eager", fullgraph=True)
+    actual = compiled(input_ids)
+
+    assert torch.equal(actual, expected)
 
 
 def test_replay_trace_reports_local_ids_and_top_logits(monkeypatch: pytest.MonkeyPatch) -> None:
