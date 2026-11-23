@@ -46,7 +46,6 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_host_stage import (
     LwdHostStager,
     LwdHostStageSlotBusy,
 )
-from vllm_ascend.worker.lwd_debug.lwd_layer_trace import lwd_trace_down_packet
 
 if TYPE_CHECKING:
     from typing import Any
@@ -629,12 +628,6 @@ class LwdCloudWorker(LwdWorkerBase):
                 ready_event = payload.ready_event
                 req_ids = payload.req_ids
                 seqno = self._lwd_next_down_seqno(connection)
-                lwd_trace_down_packet(
-                    side="cloud",
-                    seqno=seqno,
-                    hidden_states=hidden,
-                    req_ids=req_ids,
-                )
                 if connection in self._lwd_early_recv_connections:
                     lwd_logger.info(
                         "[Lwd][cloud-worker] DOWN send connection=%s seqno=%d numel=%d",

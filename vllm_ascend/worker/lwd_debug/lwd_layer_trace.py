@@ -30,91 +30,11 @@ import torch
 
 _LWD_TRACE_ENV = "VLLM_ASCEND_LWD_LAYER_TRACE"
 _MAX_STEPS = 3
-_MAX_REPLAY_BATCHES = 8
-_MAX_REPLAY_ROWS = 8
-_MAX_REPLAY_TOPK = 20
 _state: dict[str, int] = {"step": 0}
-_replay_steps: dict[str, int] = {}
 
 
 def lwd_layer_trace_enabled() -> bool:
     return os.getenv(_LWD_TRACE_ENV, "") == "1"
-
-
-def lwd_trace_replay(
-    *,
-    side: str,
-    logits: torch.Tensor,
-    selected_ids: torch.Tensor | list[int],
-    ranks: torch.Tensor | list[int],
-    req_ids: list[str],
-    seqno: int | None = None,
-) -> None:
-    """Compare local cloud selections with local edge replay, never on the wire."""
-    if not lwd_layer_trace_enabled():
-        return
-    step = _replay_steps.get(side, 0) + 1
-    _replay_steps[side] = step
-    if step > _MAX_REPLAY_BATCHES or logits.ndim != 2 or not req_ids:
-        return
-    selected = selected_ids.tolist() if isinstance(selected_ids, torch.Tensor) else selected_ids
-    rank_values = ranks.tolist() if isinstance(ranks, torch.Tensor) else ranks
-    rows = min(len(req_ids), _MAX_REPLAY_ROWS)
-    row = logits[0].detach().float()
-    values, token_ids = torch.topk(row, min(_MAX_REPLAY_TOPK, row.numel()))
-    from vllm.lwd_logger import lwd_logger as log
-
-    log.info(
-        "[replay-trace] side=%s step=%d seqno=%s req_ids=%s selected=%s ranks=%s top20=%s",
-        side,
-        step,
-        seqno,
-        req_ids[:rows],
-        selected[:rows],
-        rank_values[:rows],
-        list(zip(token_ids.tolist(), [round(v, 3) for v in values.tolist()])),
-    )
-
-
-def lwd_trace_down_packet(
-    *,
-    side: str,
-    seqno: int,
-    hidden_states: torch.Tensor,
-    req_ids: list[str],
-) -> None:
-    """Log the actual DOWN payload at both ends of one sequence number."""
-    if not lwd_layer_trace_enabled():
-        return
-    step = _replay_steps.get(f"down-{side}", 0) + 1
-    _replay_steps[f"down-{side}"] = step
-    if step > _MAX_REPLAY_BATCHES:
-        return
-    from vllm.lwd_logger import lwd_logger as log
-
-    log.info(
-        "[down-trace] side=%s step=%d seqno=%d req_ids=%s %s ptr=%s",
-        side,
-        step,
-        seqno,
-        req_ids,
-        lwd_tensor_checksum("hidden", hidden_states),
-        hex(hidden_states.data_ptr()),
-    )
-
-
-def lwd_trace_hccl_send(request: Any) -> None:
-    """Log the communication-owned snapshot immediately before HCCL isend."""
-    if not lwd_layer_trace_enabled():
-        return
-    from vllm.lwd_logger import lwd_logger as log
-
-    log.info(
-        "[hccl-send] seqno=%s ptr=%s %s",
-        request.seqno,
-        hex(request.tensor.data_ptr()),
-        lwd_tensor_checksum("hidden", request.tensor),
-    )
 
 
 def lwd_tensor_checksum(tag: str, tensor: Any) -> str:

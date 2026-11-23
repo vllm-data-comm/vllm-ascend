@@ -132,9 +132,6 @@ class LwdTransferQueue(LwdBaseTransferQueue):
             )
         tensor = req.tensor
         assert tensor is not None
-        from vllm_ascend.worker.lwd_debug.lwd_layer_trace import lwd_trace_hccl_send
-
-        lwd_trace_hccl_send(req)
         logger.debug(
             "[lwd-comm] SEND post channel=%s my_rank=%d peer=%d group_ranks=%s shape=%s dtype=%s op=isend",
             self.channel_type,

@@ -20,9 +20,6 @@ from vllm_ascend.worker.lwd_cloud_model.lwd_token_rank import (  # noqa: E402
 )
 from vllm_ascend.worker.lwd_debug.lwd_layer_trace import (  # noqa: E402
     install_lwd_layer_trace,
-    lwd_trace_down_packet,
-    lwd_trace_hccl_send,
-    lwd_trace_replay,
 )
 
 
@@ -60,73 +57,6 @@ def test_layer_trace_skips_debug_tensor_reads_during_compilation(
     actual = compiled(input_ids)
 
     assert torch.equal(actual, expected)
-
-
-def test_down_packet_trace_reports_payload_checksum(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("VLLM_ASCEND_LWD_LAYER_TRACE", "1")
-    records = []
-    monkeypatch.setattr("vllm.lwd_logger.lwd_logger.info", lambda *args: records.append(args))
-
-    lwd_trace_down_packet(
-        side="cloud-test",
-        seqno=3,
-        hidden_states=torch.tensor([[1.0, 2.0], [3.0, 4.0]]),
-        req_ids=["request-a"],
-    )
-
-    assert len(records) == 1
-    assert records[0][3] == 3
-    assert records[0][-2].startswith("hidden shape=(2, 2) numel=4 sum=10.0000")
-
-
-def test_hccl_send_trace_reports_snapshot_identity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("VLLM_ASCEND_LWD_LAYER_TRACE", "1")
-    records = []
-    monkeypatch.setattr("vllm.lwd_logger.lwd_logger.info", lambda *args: records.append(args))
-    hidden = torch.tensor([1.0])
-
-    lwd_trace_hccl_send(SimpleNamespace(seqno=2, tensor=hidden))
-
-    assert len(records) == 1
-    assert records[0][1] == 2
-    assert records[0][2] == hex(hidden.data_ptr())
-    assert records[0][3].startswith("hidden shape=(1,) numel=1 sum=1.0000")
-
-
-def test_replay_trace_reports_local_ids_and_top_logits(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("VLLM_ASCEND_LWD_LAYER_TRACE", "1")
-    records = []
-    monkeypatch.setattr("vllm.lwd_logger.lwd_logger.info", lambda *args: records.append(args))
-
-    lwd_trace_replay(
-        side="cloud-test",
-        logits=torch.tensor([[1.0, 4.0, 2.0]]),
-        selected_ids=torch.tensor([1]),
-        ranks=[0],
-        req_ids=["request-a"],
-    )
-
-    assert len(records) == 1
-    assert records[0][5] == [1]
-    assert records[0][6] == [0]
-    assert records[0][7] == [(1, 4.0), (2, 2.0), (0, 1.0)]
-
-
-def test_replay_trace_is_inert_when_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("VLLM_ASCEND_LWD_LAYER_TRACE", raising=False)
-    monkeypatch.setattr(torch, "topk", lambda *args, **kwargs: pytest.fail("topk ran while trace was disabled"))
-
-    lwd_trace_replay(
-        side="edge-test",
-        logits=torch.tensor([[1.0]]),
-        selected_ids=[0],
-        ranks=[0],
-        req_ids=["request-a"],
-    )
 
 
 def assert_round_trip(
