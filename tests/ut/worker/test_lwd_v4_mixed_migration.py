@@ -303,9 +303,10 @@ class FakeCopyTensor:
         self.drop_first = drop_first
         self.always_mismatch = always_mismatch
         self.copies = 0
+        self.non_blocking = []
 
     def copy_(self, src, non_blocking):
-        assert non_blocking is False
+        self.non_blocking.append(non_blocking)
         self.copies += 1
         if self.always_mismatch or (self.drop_first and self.copies == 1):
             return self
@@ -360,6 +361,7 @@ class TestH2DCopyVerified(unittest.TestCase):
         src = FakeCopyTensor(torch.arange(4, dtype=torch.float32))
         for strict in (True, False):
             with self.subTest(strict=strict):
+                self.runner._lwd_h2d_copy_warmed = False
                 self.stream.reset_mock()
                 self.logger.reset_mock()
                 dst = FakeCopyTensor(torch.zeros(4), always_mismatch=True)
@@ -380,6 +382,7 @@ class TestH2DCopyVerified(unittest.TestCase):
         )
         for sample in samples:
             with self.subTest(sample=sample):
+                self.runner._lwd_h2d_copy_warmed = False
                 self.stream.reset_mock()
                 src = FakeCopyTensor(sample)
                 dst = FakeCopyTensor(torch.full_like(sample, 42))
@@ -390,10 +393,21 @@ class TestH2DCopyVerified(unittest.TestCase):
                 self.assertEqual(dst.copies, 1)
                 self.assertEqual(self.stream.synchronize.call_count, 1)
 
+    def test_successful_warmup_restores_async_copy(self):
+        src = FakeCopyTensor(torch.arange(4, dtype=torch.float32))
+        dst = FakeCopyTensor(torch.zeros(4))
+
+        self.copy(src, dst)
+        self.copy(src, dst)
+
+        self.assertEqual(dst.non_blocking, [False, True])
+        self.assertEqual(self.stream.synchronize.call_count, 1)
+
     def test_mismatching_nan_honors_strict_mode(self):
         src = FakeCopyTensor(torch.tensor([torch.nan, 1.0]))
         for strict in (True, False):
             with self.subTest(strict=strict):
+                self.runner._lwd_h2d_copy_warmed = False
                 self.stream.reset_mock()
                 dst = FakeCopyTensor(torch.zeros(2), always_mismatch=True)
                 if strict:
