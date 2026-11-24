@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 import queue
+from contextlib import nullcontext
+from types import SimpleNamespace
 
 import pytest
 from vllm.distributed.lwd.host import ucx_io
@@ -115,6 +117,65 @@ def test_sender_thread_resolves_unindexed_device_on_caller_thread(
 
     assert not io._send_thread.is_alive()
     assert selected == [3]
+
+
+def test_send_uses_stream_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    staging = SimpleNamespace(buf=bytearray(4), addr=123)
+    sent = []
+    io = object.__new__(LwdBaseUcxChannelIo)
+    io._ch = SimpleNamespace(
+        acquire_staging=lambda: staging,
+        send=lambda *args, **kwargs: sent.append((args, kwargs)),
+        release_staging=lambda block: None,
+    )
+    io._stream = nullcontext()
+    io._block_bytes = 4
+    io._block_env = "data_plane_host.up_buffer_size"
+    io._tr_d2h = False
+    future = SimpleNamespace(_bind=lambda **kwargs: None)
+    monkeypatch.setattr(
+        ucx_io.torch,
+        "stream",
+        lambda stream: pytest.fail("torch.stream is not a backend-independent API"),
+        raising=False,
+    )
+    tensor = ucx_io.torch.tensor([1, 2], dtype=ucx_io.torch.bfloat16)
+
+    io._do_send(0, tensor, None, future)
+
+    assert ucx_io.torch.equal(
+        ucx_io.torch.frombuffer(staging.buf, dtype=ucx_io.torch.bfloat16),
+        tensor,
+    )
+    assert sent[0][0][:3] == (0, 123, 4)
+
+
+def test_receive_staging_uses_stream_context(monkeypatch: pytest.MonkeyPatch) -> None:
+    class Stream(nullcontext):
+        def wait_event(self, event: object) -> None:
+            pass
+
+    io = object.__new__(LwdBaseUcxChannelIo)
+    io._copy_stream = Stream()
+    io._device = ucx_io.torch.device("cpu")
+    buffer = ucx_io.torch.tensor([1, 2], dtype=ucx_io.torch.bfloat16)
+    destination = ucx_io.torch.zeros(2, dtype=ucx_io.torch.bfloat16)
+    request = SimpleNamespace(stage_segments=[(destination, 0, 2)])
+    monkeypatch.setattr(
+        ucx_io.torch,
+        "stream",
+        lambda stream: pytest.fail("torch.stream is not a backend-independent API"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ucx_io.torch,
+        "Event",
+        lambda: SimpleNamespace(record=lambda: None),
+    )
+
+    io._stage_to_buffers(buffer, request, object())
+
+    assert ucx_io.torch.equal(destination, buffer)
 
 
 def test_early_frame_capacity_is_passed_to_the_transport(monkeypatch) -> None:
