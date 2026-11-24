@@ -93,6 +93,30 @@ def test_send_waits_for_the_producer_before_queueing(producer_stream) -> None:
     assert io._events == [("wait", producer_stream), ("put", 7)]
 
 
+def test_sender_thread_resolves_unindexed_device_on_caller_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ucx_io, "open_transport", lambda *args, **kwargs: object())
+    monkeypatch.setattr(ucx_io.torch, "Stream", lambda **kwargs: object())
+    monkeypatch.setattr(ucx_io.torch.accelerator, "current_device_index", lambda: 3)
+    selected = []
+    monkeypatch.setattr(ucx_io.torch.accelerator, "set_device_index", selected.append)
+    config = ucx_io.LwdUcxChannelIoConfig(
+        op="send",
+        device=ucx_io.torch.device("cuda"),
+        up_block_mb=128,
+        down_block_mb=32,
+        token=1,
+    )
+
+    io = ucx_io.LwdBaseUcxChannelIo(ucx_io.LwdChannelType.UP, object(), config)
+    io._sq.put(None)
+    io._send_thread.join(timeout=1.0)
+
+    assert not io._send_thread.is_alive()
+    assert selected == [3]
+
+
 def test_early_frame_capacity_is_passed_to_the_transport(monkeypatch) -> None:
     """The old branch's 4096 early-frame budget must not fall back to 4."""
     captured = {}
