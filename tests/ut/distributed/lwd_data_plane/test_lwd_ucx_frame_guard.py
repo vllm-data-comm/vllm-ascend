@@ -119,6 +119,25 @@ def test_sender_thread_resolves_unindexed_device_on_caller_thread(
     assert selected == [3]
 
 
+def test_receive_resolves_unindexed_device_on_caller_thread(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(ucx_io, "open_transport", lambda *args, **kwargs: object())
+    monkeypatch.setattr(ucx_io.torch, "Stream", lambda **kwargs: object())
+    monkeypatch.setattr(ucx_io.torch.accelerator, "current_device_index", lambda: 3)
+    config = ucx_io.LwdUcxChannelIoConfig(
+        op="recv",
+        device=ucx_io.torch.device("cuda"),
+        up_block_mb=128,
+        down_block_mb=32,
+        token=1,
+    )
+
+    io = ucx_io.LwdBaseUcxChannelIo(ucx_io.LwdChannelType.UP, object(), config)
+
+    assert io._device_index == 3
+
+
 def test_send_uses_stream_context(monkeypatch: pytest.MonkeyPatch) -> None:
     staging = SimpleNamespace(buf=bytearray(4), addr=123)
     sent = []
@@ -178,8 +197,18 @@ def test_receive_staging_uses_stream_context(monkeypatch: pytest.MonkeyPatch) ->
     assert ucx_io.torch.equal(destination, buffer)
 
 
+@pytest.mark.parametrize(
+    ("device", "device_index", "expected"),
+    [
+        (ucx_io.torch.device("cuda"), 2, [2]),
+        (ucx_io.torch.device("cpu"), None, []),
+    ],
+)
 def test_receive_callback_uses_resolved_device_and_stream_context(
     monkeypatch: pytest.MonkeyPatch,
+    device: ucx_io.torch.device,
+    device_index: int | None,
+    expected: list[int],
 ) -> None:
     selected = []
     monkeypatch.setattr(ucx_io.torch.accelerator, "set_device_index", selected.append)
@@ -195,8 +224,8 @@ def test_receive_callback_uses_resolved_device_and_stream_context(
         lambda: SimpleNamespace(record=lambda: None),
     )
     io = object.__new__(LwdBaseUcxChannelIo)
-    io._device = ucx_io.torch.device("cuda")
-    io._device_index = 2
+    io._device = device
+    io._device_index = device_index
     io._stream = nullcontext()
     io.tag = "lwd_up/recv"
     io._tr_recv_done = False
@@ -213,7 +242,7 @@ def test_receive_callback_uses_resolved_device_and_stream_context(
 
     io._recv_cb(buffer, None, future, request)(op)
 
-    assert selected == [2]
+    assert selected == expected
     assert ucx_io.torch.equal(
         buffer,
         ucx_io.torch.tensor([1, 2], dtype=ucx_io.torch.bfloat16),
