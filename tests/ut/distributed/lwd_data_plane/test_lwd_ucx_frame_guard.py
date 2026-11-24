@@ -178,6 +178,48 @@ def test_receive_staging_uses_stream_context(monkeypatch: pytest.MonkeyPatch) ->
     assert ucx_io.torch.equal(destination, buffer)
 
 
+def test_receive_callback_uses_resolved_device_and_stream_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    selected = []
+    monkeypatch.setattr(ucx_io.torch.accelerator, "set_device_index", selected.append)
+    monkeypatch.setattr(
+        ucx_io.torch,
+        "stream",
+        lambda stream: pytest.fail("torch.stream is not a backend-independent API"),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        ucx_io.torch,
+        "Event",
+        lambda: SimpleNamespace(record=lambda: None),
+    )
+    io = object.__new__(LwdBaseUcxChannelIo)
+    io._device = ucx_io.torch.device("cuda")
+    io._device_index = 2
+    io._stream = nullcontext()
+    io.tag = "lwd_up/recv"
+    io._tr_recv_done = False
+    buffer = ucx_io.torch.zeros(2, dtype=ucx_io.torch.bfloat16)
+    future = SimpleNamespace(_bind=lambda **kwargs: None)
+    request = SimpleNamespace(stage_segments=None)
+    op = SimpleNamespace(
+        tag=0,
+        error=None,
+        data=bytearray(
+            ucx_io.torch.tensor([1, 2], dtype=ucx_io.torch.bfloat16).view(ucx_io.torch.int16).numpy().tobytes()
+        ),
+    )
+
+    io._recv_cb(buffer, None, future, request)(op)
+
+    assert selected == [2]
+    assert ucx_io.torch.equal(
+        buffer,
+        ucx_io.torch.tensor([1, 2], dtype=ucx_io.torch.bfloat16),
+    )
+
+
 def test_early_frame_capacity_is_passed_to_the_transport(monkeypatch) -> None:
     """The old branch's 4096 early-frame budget must not fall back to 4."""
     captured = {}
