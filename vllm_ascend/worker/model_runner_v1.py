@@ -2520,6 +2520,13 @@ class NPUModelRunner(GPUModelRunner):
                     cudagraph_runtime_mode=cudagraph_mode,
                     batch_descriptor=batch_desc,
                 )
+                if self.vllm_config.lwd_config is not None and self.tp_rank == 0:
+                    lwd_logger.info(
+                        "[LWD][input] attention ready dp=%d tp=%d scheduled=%s",
+                        self.dp_rank,
+                        self.tp_rank,
+                        scheduler_output.num_scheduled_tokens,
+                    )
 
                 self._sanitize_placeholder_input_ids_for_forward(
                     scheduler_output,

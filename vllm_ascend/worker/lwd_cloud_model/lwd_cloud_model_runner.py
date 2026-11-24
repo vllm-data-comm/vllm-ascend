@@ -296,6 +296,18 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         num_scheduled_tokens: np.ndarray,
     ) -> tuple[torch.Tensor, SpecDecodeMetadata | None, int]:
         """Prime full-prompt M-RoPE and harvest arrivals before native preparation."""
+
+        def trace(message: str, *args: Any) -> None:
+            if self.tp_rank != 0:
+                return
+            lwd_logger.info(
+                "[LWD][input] dp=%d tp=%d scheduled=%s " + message,
+                self.dp_rank,
+                self.tp_rank,
+                scheduler_output.num_scheduled_tokens,
+                *args,
+            )
+
         for new_req in scheduler_output.scheduled_new_reqs:
             spans = list(new_req.lwd_image_placeholder_spans)
             lwd_check_image_placeholder_spans(new_req.req_id, spans, self.lwd_engram_inputs is not None)
@@ -308,32 +320,52 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             if prompt_len <= 0:
                 raise RuntimeError(f"[Lwd][cloud-runner] mrope prime req={new_req.req_id}: prompt length is missing")
             self._lwd_prime_mrope_positions(new_req.req_id, payload, prompt_len)
+        trace("harvest enter")
         windows = self._lwd_harvest_up_batches(num_scheduled_tokens, scheduler_output)
+        trace(
+            "harvest exit windows=%s",
+            [(window.req_id, window.start, window.rows) for window in windows],
+        )
         # Native placeholder assembly contains only zeros. Skip its redundant
         # host copy and H2D; the arrival window below is authoritative.
         embeds_map = self.input_batch.req_prompt_embeds
         self.input_batch.req_prompt_embeds = {}
+        trace("native prepare enter")
         try:
             out = super()._prepare_inputs(scheduler_output, num_scheduled_tokens)
         finally:
             self.input_batch.req_prompt_embeds = embeds_map
+        trace("native prepare exit")
         self._lwd_rebuild_is_token_ids_mask(num_scheduled_tokens)
         self._lwd_release_consumed_prompt_embeds()
+        trace("mask and release exit")
         for window in windows:
+            trace(
+                "inject enter req=%s start=%d rows=%d",
+                window.req_id,
+                window.start,
+                window.rows,
+            )
             self._lwd_inject_remote_embeds(
                 window.dev,
                 window.win_idx,
                 window.plan,
                 num_scheduled_tokens,
             )
+            trace("inject exit req=%s", window.req_id)
         if self.lwd_hash_state is not None:
+            trace("hash enter")
             self._lwd_prepare_hash_batch(num_scheduled_tokens)
+            trace("hash exit")
         if self.lwd_engram_inputs is not None:
+            trace("engram enter")
             self.lwd_engram_inputs.plan_step(
                 self._lwd_engram_batch_view(self.input_batch.num_reqs),
                 num_scheduled_tokens,
                 self._lwd_engram_staging("engram_row_codes", torch.int32, self.lwd_engram_inputs.row_codes_capacity),
             )
+            trace("engram exit")
+        trace("prepare exit")
         return out
 
     def _lwd_engram_batch_view(self, num_reqs: int) -> LwdEngramBatchView:
@@ -464,6 +496,14 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         ECConnectorOutput | None,
     ]:
         """Refresh the decode mask after the async speculative-position fix, then prepare model inputs."""
+        trace = self.tp_rank == 0
+        if trace:
+            lwd_logger.info(
+                "[LWD][input] preprocess enter dp=%d tp=%d scheduled=%s",
+                self.dp_rank,
+                self.tp_rank,
+                scheduler_output.num_scheduled_tokens,
+            )
         if (
             self.use_async_spec_decode
             and self.enable_prompt_embeds
@@ -471,17 +511,37 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             and (self.vllm_config.parallel_config.prefill_context_parallel_size == 1)
         ):
             self._lwd_refresh_decode_embedding_mask(scheduler_output)
+            if trace:
+                lwd_logger.info(
+                    "[LWD][input] decode mask exit dp=%d tp=%d",
+                    self.dp_rank,
+                    self.tp_rank,
+                )
             if (
                 get_pp_group().is_first_rank
                 and not self.model_config.is_encoder_decoder
                 and (not self.supports_mm_inputs or self.input_batch.req_prompt_embeds)
             ):
-                return self._lwd_preprocess_prompt_embeds(scheduler_output, num_input_tokens)
+                output = self._lwd_preprocess_prompt_embeds(scheduler_output, num_input_tokens)
+                if trace:
+                    lwd_logger.info(
+                        "[LWD][input] preprocess exit dp=%d tp=%d",
+                        self.dp_rank,
+                        self.tp_rank,
+                    )
+                return output
             # Other model paths keep the parent's preprocessing, which may
             # still consume the CPU mask (for example encoder-decoder models).
             count = scheduler_output.total_num_scheduled_tokens
             self.is_token_ids.np[:count] = self.is_token_ids.gpu[:count].cpu().numpy()
-        return super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
+        output = super()._preprocess(scheduler_output, num_input_tokens, intermediate_tensors)
+        if trace:
+            lwd_logger.info(
+                "[LWD][input] preprocess exit dp=%d tp=%d",
+                self.dp_rank,
+                self.tp_rank,
+            )
+        return output
 
     # ------------------------------------------------------------------ #
     # Zero-base-weave seams: all LWD behavior surfaces via subclass    #
@@ -845,6 +905,16 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 dev = torch.empty(numel, dtype=torch.bfloat16, device=self.device)
                 win_idx = None
             if tp.world_size > 1:
+                lwd_logger.info(
+                    "[LWD][input] broadcast enter dp=%d tp=%d rows=%d "
+                    "numel=%d src=%d scheduled=%s",
+                    self.dp_rank,
+                    self.tp_rank,
+                    sum(window.rows for window in connection_plan),
+                    numel,
+                    worker._lwd_up_src_ranks[connection],
+                    scheduler_output.num_scheduled_tokens if scheduler_output is not None else {},
+                )
                 work = dist.broadcast(
                     dev,
                     src=worker._lwd_up_src_ranks[connection],
@@ -852,6 +922,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                     async_op=True,
                 )
                 work.wait()
+                lwd_logger.info(
+                    "[LWD][input] broadcast exit dp=%d tp=%d numel=%d",
+                    self.dp_rank,
+                    self.tp_rank,
+                    numel,
+                )
             windows.append(LwdUpWindow(connection, dev, win_idx, connection_plan))
         return windows
 
