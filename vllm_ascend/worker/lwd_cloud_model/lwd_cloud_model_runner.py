@@ -324,7 +324,11 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         windows = self._lwd_harvest_up_batches(num_scheduled_tokens, scheduler_output)
         trace(
             "harvest exit windows=%s",
-            [(window.req_id, window.start, window.rows) for window in windows],
+            [
+                (prompt.req_id, prompt.start, prompt.rows)
+                for window in windows
+                for prompt in window.plan
+            ],
         )
         # Native placeholder assembly contains only zeros. Skip its redundant
         # host copy and H2D; the arrival window below is authoritative.
@@ -341,10 +345,12 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         trace("mask and release exit")
         for window in windows:
             trace(
-                "inject enter req=%s start=%d rows=%d",
-                window.req_id,
-                window.start,
-                window.rows,
+                "inject enter connection=%s windows=%s",
+                window.connection,
+                [
+                    (prompt.req_id, prompt.start, prompt.rows)
+                    for prompt in window.plan
+                ],
             )
             self._lwd_inject_remote_embeds(
                 window.dev,
@@ -352,7 +358,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                 window.plan,
                 num_scheduled_tokens,
             )
-            trace("inject exit req=%s", window.req_id)
+            trace("inject exit connection=%s", window.connection)
         if self.lwd_hash_state is not None:
             trace("hash enter")
             self._lwd_prepare_hash_batch(num_scheduled_tokens)
