@@ -1064,15 +1064,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
         num_rejected_tokens_gpu: torch.Tensor | None = None,
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
-        if (
-            self.method == "dspark"
-            and self.runner.vllm_config.lwd_config is not None
-        ):
-            logger.info(
-                "[LWD][dspark] propose enter dp=%d batch=%d",
-                self.runner.dp_rank,
-                batch_size,
-            )
 
         # Dynamic SD: take the scheduled per-step K as an explicit argument and
         # set it here -- mirroring vLLM's ``propose(num_speculative_tokens=...)``
@@ -1119,15 +1110,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
             num_prefill_reqs=num_prefill_reqs,
             num_decode_reqs=num_decode_reqs,
         )
-        if (
-            self.method == "dspark"
-            and self.runner.vllm_config.lwd_config is not None
-        ):
-            logger.info(
-                "[LWD][dspark] inputs ready dp=%d draft_rows=%d",
-                self.runner.dp_rank,
-                num_tokens,
-            )
         assert self.runner is not None
         dcp_manager = getattr(self.runner, "dcp_manager", None)
         if dcp_manager is not None and not self.parallel_drafting:
@@ -1454,11 +1436,6 @@ class AscendSpecDecodeBaseProposer(SpecDecodeBaseProposer):
                 self._update_full_graph_params_if_needed(forward_context, num_input_tokens, multi_steps_attn_metadata)
         if active_device_metadata_executor is not None:
             active_device_metadata_executor.release()
-        if (
-            self.method == "dspark"
-            and self.runner.vllm_config.lwd_config is not None
-        ):
-            logger.info("[LWD][dspark] propose exit dp=%d", self.runner.dp_rank)
         return draft_token_ids
 
     def _sample_draft_from_logits(
