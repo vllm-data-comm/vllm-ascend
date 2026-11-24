@@ -571,11 +571,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             consumed = stager.consumed_rows(req_id)
             if consumed > new_computed:
                 stager.rewind_consumed(req_id, new_computed)
-                if self.lwd_engram_inputs is not None and new_computed == 0:
-                    # The rewound request re-sends its first chunk, which
-                    # builds a fresh record; the stale one would be a
-                    # duplicate.
-                    self.lwd_engram_inputs.release(req_id)
                 lwd_logger.info(
                     "[LWD][cloud-runner] REWIND req=%s: host read pointer "
                     "%d -> %d (preemption recompute; payload retained)",
