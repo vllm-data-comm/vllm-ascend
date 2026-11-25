@@ -496,8 +496,15 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         stager = worker._lwd_stager
         if stager is None:
             return
+        request_positions = [
+            (req.req_id, req.num_computed_tokens)
+            for req in scheduler_output.scheduled_new_reqs
+        ]
         cached = scheduler_output.scheduled_cached_reqs
-        for req_id, new_computed in zip(cached.req_ids, cached.num_computed_tokens):
+        request_positions.extend(zip(cached.req_ids, cached.num_computed_tokens))
+        # Reset can re-admit a first-time request through scheduled_new_reqs;
+        # its host buffer needs the same alignment as cached re-admissions.
+        for req_id, new_computed in request_positions:
             # Each connection is staged only on its real endpoint rank. Other
             # TP ranks must not rewind a nonexistent local host descriptor.
             if stager.take_req(req_id) is None:
