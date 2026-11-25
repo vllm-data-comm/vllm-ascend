@@ -216,6 +216,10 @@ class LwdCloudWorker(LwdWorkerBase):
         self._early_recv_pending: dict[tuple[ConnectionId, LwdChannelType, int], dict[str, Any]] = {}
         self._early_recv_reserved: set[tuple[ConnectionId, LwdChannelType, int]] = set()
         self._early_recv_last_delivered: dict[ConnectionId, int] = {}
+        # Done reports whose enqueue is deferred because the done MQ is
+        # temporarily full. Each entry is ``(connection, seqno, payload)``;
+        # flushed FIFO across connections on every report pass, never dropped.
+        self._early_recv_report_pending: list[tuple[ConnectionId, int, Any]] = []
         self._early_recv_failed_connections: set[ConnectionId] = set()
         self._early_recv_current_key: tuple[ConnectionId, LwdChannelType, int] | None = None
         self._early_recv_rr = 0
@@ -330,6 +334,11 @@ class LwdCloudWorker(LwdWorkerBase):
                 connection = key[0]
                 self._lwd_fail_early_recv_connection(connection, self._early_recv_error_seqno(connection), exc)
             if hint_mqs and all(connection in self._early_recv_failed_connections for connection in hint_mqs):
+                # Best-effort delivery of anything a fail path just queued
+                # during the tail flush (error reports included) before the
+                # comm thread exits for good; a full MQ simply leaves those
+                # reports undelivered.
+                self._lwd_flush_pending_reports()
                 return
             # The ring's read side sched_yield-spins within the
             # just-read window (busy_loop_s=1s), so a 0.5ms timeout alone
@@ -360,6 +369,9 @@ class LwdCloudWorker(LwdWorkerBase):
             for key in list(self._early_recv_pending):
                 if key[0] == connection:
                     self._early_recv_pending.pop(key, None)
+            self._early_recv_report_pending = [
+                item for item in self._early_recv_report_pending if item[0] != connection
+            ]
             futures = [future for key, future in self._early_recv_futures.items() if key[0] == connection]
             for key in list(self._early_recv_futures):
                 if key[0] == connection:
@@ -382,16 +394,14 @@ class LwdCloudWorker(LwdWorkerBase):
         except Exception:
             lwd_logger.exception("[Lwd][pre-recv] failed to clean data plane connection=%s", connection)
         lwd_logger.exception("[Lwd][pre-recv] connection failed connection=%s seqno=%d", connection, seqno)
-        done_mq = self._irecv_done_mqs.get(connection)
-        if done_mq is not None:
-            try:
-                done_mq.enqueue((connection, "error", seqno, repr(exc)))
-            except Exception:
-                lwd_logger.exception(
-                    "[Lwd][pre-recv] failed to report comm error connection=%s seqno=%d",
-                    connection,
-                    seqno,
-                )
+        # The error report rides the same pending/flush path as regular
+        # reports: the nearest flush (the harvest path's tail flush, the
+        # loop's next head flush from the hint path, or the exit flush
+        # before the all-failed return) delivers it with a timeout=0 probe
+        # and retries while the MQ is full.
+        if self._irecv_done_mqs.get(connection) is not None:
+            with self._early_recv_lock:
+                self._early_recv_report_pending.append((connection, seqno, (connection, "error", seqno, repr(exc))))
 
     def start_early_irecv(
         self,
@@ -551,7 +561,15 @@ class LwdCloudWorker(LwdWorkerBase):
             )
 
     def _report_irecv_completions(self) -> None:
-        """Publish each connection's contiguous completion prefix independently."""
+        """Publish each connection's contiguous completion prefix independently.
+
+        Publishing a finished receive frees its slot immediately, while the
+        done-MQ write is deferred to ``_early_recv_report_pending`` whenever
+        the MQ is momentarily full. Every enqueue is a non-blocking
+        ``timeout=0`` probe, so the comm thread never re-parks on the GIL —
+        the exact condition that starved hint consumption and froze the
+        engine at its step head.
+        """
         stager = self._lwd_stager
         if stager is None:
             return
@@ -584,9 +602,13 @@ class LwdCloudWorker(LwdWorkerBase):
                 stager.release_if_drained(stage_key)
                 arrived = [(req_id, offset + rows) for req_id, rows, offset in published]
                 future.release_device_tensor()
-                for req_id, nonce in stager.take_refill_done(connection):
-                    done_mq.enqueue(("refill_done", req_id, nonce))
-                done_mq.enqueue((key, arrived))
+                # refill_done must precede the watermark so a concurrent
+                # drain opens the refill gate before the seqno completes.
+                reports = [
+                    (connection, seqno, ("refill_done", req_id, nonce))
+                    for req_id, nonce in stager.take_refill_done(connection)
+                ]
+                reports.append((connection, seqno, (key, arrived)))
             except Exception as exc:
                 self._lwd_fail_early_recv_connection(connection, seqno, exc)
                 blocked.add(connection)
@@ -596,15 +618,71 @@ class LwdCloudWorker(LwdWorkerBase):
             with self._early_recv_lock:
                 self._early_recv_futures.pop(key, None)
                 self._early_recv_last_delivered[connection] = seqno
-            self._early_recv_current_key = None
+                backlog = len(self._early_recv_report_pending)
+                self._early_recv_report_pending.extend(reports)
+            # Logged at generation, not delivery: the report may still be
+            # parked by a full done MQ; ``backlog`` (reports already waiting
+            # when this one was harvested) is the backlog signal.
             lwd_logger.info(
-                "[Lwd][pre-recv] REPORT connection=%s channel=%s seqno=%d arrivals=%s",
+                "[Lwd][pre-recv] REPORT connection=%s channel=%s seqno=%d arrivals=%s backlog=%d",
                 connection,
                 channel.value,
                 seqno,
                 arrived,
+                backlog,
             )
+        # One flush per pass covers the whole pending FIFO in order: last
+        # pass's leftovers, this pass's reports, and any error a fail path
+        # queued during the loop above.
+        self._lwd_flush_pending_reports()
         self._early_recv_pump()
+
+    def _lwd_flush_pending_reports(self) -> None:
+        """Forward pending done reports with non-blocking enqueue probes.
+
+        Each report is enqueued with ``timeout=0``: one availability check -
+        write on success, immediate TimeoutError when the MQ is full. Timed-out
+        reports are retained in FIFO order and retried on the next pass; the
+        comm loop itself is the retry driver, so no timers or extra state are
+        involved. A report is never dropped on a full MQ - losing a
+        ``refill_done`` gate or a seqno watermark would stall the connection.
+        Regular reports of a failed connection are dead letters (the error
+        report has taken over), but error reports keep being delivered.
+        """
+        if not self._early_recv_report_pending:
+            return
+        with self._early_recv_lock:
+            pending = self._early_recv_report_pending
+            self._early_recv_report_pending = []
+        remaining: list[tuple[ConnectionId, int, Any]] = []
+        stalled: set[ConnectionId] = set()
+        for connection, seqno, payload in pending:
+            is_error_report = isinstance(payload, tuple) and len(payload) == 4 and payload[1] == "error"
+            if connection in self._early_recv_failed_connections and not is_error_report:
+                continue
+            if connection in stalled:
+                remaining.append((connection, seqno, payload))
+                continue
+            done_mq = self._irecv_done_mqs.get(connection)
+            if done_mq is None:
+                remaining.append((connection, seqno, payload))
+                continue
+            try:
+                # timeout=0 is a pure availability probe: acquire_write
+                # checks the slot once and raises immediately when the MQ is
+                # full (the spinloop extension, if ever enabled, would break
+                # this one-check contract with its 0.1s floor).
+                done_mq.enqueue(payload, timeout=0)
+            except TimeoutError:
+                # One full MQ stalls the rest of this connection's reports
+                # (FIFO), but not other connections'. Re-queue and try again
+                # after the comm thread has consumed more hints.
+                stalled.add(connection)
+                remaining.append((connection, seqno, payload))
+            except Exception as exc:
+                self._lwd_fail_early_recv_connection(connection, seqno, exc)
+        with self._early_recv_lock:
+            self._early_recv_report_pending.extend(remaining)
 
     @torch.inference_mode()
     def sample_tokens(self, grammar_output: GrammarOutput) -> ModelRunnerOutput | AsyncModelRunnerOutput:

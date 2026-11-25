@@ -116,6 +116,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
     # the HF config are immutable at runtime. Class-level defaults keep
     # instances built via __new__ (tests) from tripping on missing attrs.
     _lwd_up_layout_cached: LwdUpPayloadLayout | None = None
+    # Default per-stream state for instances built via __new__ (tests).
+    _lwd_h2d_verified = False
 
     def __init__(
         self,
@@ -126,6 +128,8 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         super().__init__(vllm_config, device, worker)
         self._lwd_pending_down_payload = None
         self._lwd_request_connections: dict[str, ConnectionId] = {}
+        self._lwd_h2d_copy_stream = None
+        self._lwd_h2d_verified = False
         self._lwd_token_rank_encoder = LwdTokenRankEncoder()
         # Row-slot residue cleanup: flush reused rows as soon as a request
         # is admitted (2026-10-21 MTE root-cause closure)
@@ -499,11 +503,6 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             consumed = stager.consumed_rows(req_id)
             if consumed > new_computed:
                 stager.rewind_consumed(req_id, new_computed)
-                if self.lwd_engram_inputs is not None and new_computed == 0:
-                    # The rewound request re-sends its first chunk, which
-                    # builds a fresh record; the stale one would be a
-                    # duplicate.
-                    self.lwd_engram_inputs.release(req_id)
                 lwd_logger.info(
                     "[LWD][cloud-runner] REWIND req=%s: host read pointer "
                     "%d -> %d (preemption recompute; payload retained)",
@@ -896,7 +895,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         win_idx: int,
         layout: LwdUpPayloadLayout,
     ) -> None:
-        """Reassemble host embeddings and tail segments on the dedicated H2D stream."""
+        """Submit host embeddings and tail segments on the dedicated H2D stream."""
         started = time.monotonic()
         hidden_size = layout.hidden_size
         total_rows = sum(window.rows for window in plan)
@@ -919,19 +918,20 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
                         continue
                     tail_start, _ = req.tail_range_at(index, window.start, window.rows)
                     numel = window.rows * per_row
-                    # Same first-copy-loss risk, same helper (expert-ID and
-                    # Engram bytes may legitimately be zero: retry only, no
-                    # fail-fast).
-                    self._lwd_h2d_copy_verified(
-                        dev[tail_offsets[index] : tail_offsets[index] + numel],
+                    dev[tail_offsets[index] : tail_offsets[index] + numel].copy_(
                         req.host[tail_start : tail_start + numel],
-                        window.req_id,
-                        strict=False,
+                        non_blocking=True,
                     )
                     tail_offsets[index] += numel
             ready_event = torch.npu.Event()
             ready_event.record(stream)
         torch.npu.current_stream().wait_event(ready_event)
+        if not self._lwd_h2d_verified:
+            self._lwd_verify_staged_plan(stager, plan, dev, layout)
+            self._lwd_h2d_verified = True
+            lwd_logger.info(
+                "[LWD][cloud-runner] H2D first-window verification complete; subsequent windows skip readback"
+            )
         for window in plan:
             stager.consume(window.req_id, window.rows)
         lwd_logger.info(
@@ -941,8 +941,42 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             (time.monotonic() - started) * 1000,
         )
 
-    def _lwd_h2d_copy_verified(self, dst: torch.Tensor, src: torch.Tensor, rid: str, strict: bool = True) -> None:
-        """Pinned-to-device-window H2D copy (sync + read-back check + one retry).
+    def _lwd_verify_staged_plan(
+        self,
+        stager: LwdHostStager,
+        plan: list[LwdPromptWindow],
+        dev: torch.Tensor,
+        layout: LwdUpPayloadLayout,
+    ) -> None:
+        """Verify each slice in one staged window after ready_event, before consume."""
+        total_rows = sum(window.rows for window in plan)
+        embed_offset = 0
+        tail_offsets = list(layout.segment_offsets(total_rows))
+        for window in plan:
+            req = stager.take_req(window.req_id)
+            assert req is not None
+            host_start, numel, _ = stager.segment_for(window.req_id, window.rows)
+            self._lwd_h2d_verify_after_ready(
+                dev[embed_offset : embed_offset + numel],
+                req.host[host_start : host_start + numel],
+                window.req_id,
+            )
+            embed_offset += numel
+            for index, per_row in enumerate(layout.tail_sizes_per_token):
+                if not per_row:
+                    continue
+                tail_start, _ = req.tail_range_at(index, window.start, window.rows)
+                tail_numel = window.rows * per_row
+                self._lwd_h2d_verify_after_ready(
+                    dev[tail_offsets[index] : tail_offsets[index] + tail_numel],
+                    req.host[tail_start : tail_start + tail_numel],
+                    window.req_id,
+                    strict=False,
+                )
+                tail_offsets[index] += tail_numel
+
+    def _lwd_h2d_verify_after_ready(self, dst: torch.Tensor, src: torch.Tensor, rid: str, strict: bool = True) -> None:
+        """Verify an asynchronous copy after ready_event and retry once on mismatch.
 
         Root-cause fix for the 2E2C cold-start first window (2026-11, ported
         from cr_mi_to_23.0_azy_1029_memc b471c205b): right after a segmented
@@ -957,34 +991,23 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self-heals afterwards, no error anywhere.
 
         The check compares the first 16 destination elements with the same
-        source elements, including matching NaNs. All-zero and zero-sum data
-        therefore pass the element-wise comparison — but a full-buffer
-        absolute-sum guard catches the case where a lost copy leaves dst
-        all-zero while src is non-zero and the head-16 sample happens to
-        match (both zero).  ``strict=False`` is for the expert-ID tail: retry
-        a mismatch once, but never fail; the retry is idempotent. The
-        standing cost is one blocking copy plus a bounded sample comparison
-        and one reduction on the H2D stream.
+        source elements, including matching NaNs. A full-buffer absolute-sum
+        guard also catches a dropped copy that leaves dst all-zero while src
+        is non-zero, even when their head samples are both zero.
+        ``strict=False`` is for the expert-ID tail: retry once but never fail
+        because zero expert-ID bytes are legitimate. Verification runs for
+        the first window on each H2D stream.
 
-        Sync scope: the read-back only needs the *issuing* stream drained,
-        which the blocking ``copy_`` already guarantees, so a stream-level
-        synchronize suffices. Cross-stream visibility towards the compute
-        stream is owned by the ``ready_event`` bridge recorded after the
-        window is staged. A device-wide ``torch.npu.synchronize()`` would
-        additionally park the engine thread behind every unrelated
-        in-flight stream (previous window's forward tail, DOWN sends,
-        early-recv HCCL ops) at each staging point with no correctness
-        gain, and is deliberately avoided here.
+        The compute stream waits on ready_event before this readback. Only a
+        mismatching slice pays for a blocking retry on the compute stream; no
+        device-wide synchronize is needed.
         """
-        dst.copy_(src, non_blocking=False)
-        torch.npu.current_stream().synchronize()
         dst_sample = dst[:_LWD_H2D_VERIFY_ELEMENTS]
         src_sample = src[:_LWD_H2D_VERIFY_ELEMENTS]
 
         def samples_match() -> bool:
-            # Full-buffer guard: a silently dropped copy_ leaves dst all
-            # zero; if src is non-zero this is always a failure even when
-            # the head-16 sample happens to match (both zero).
+            # If src is non-zero, a dropped copy that leaves dst all-zero is
+            # a failure even when both head-16 samples are zero.
             if float(src.abs().sum()) != 0.0 and float(dst.abs().sum()) == 0.0:
                 return False
             try:
@@ -1004,7 +1027,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         if samples_match():
             return
         lwd_logger.warning(
-            "[LWD][cloud-runner] H2D first-copy mismatch req=%s (sample differs after sync copy; retrying)",
+            "[LWD][cloud-runner] H2D first-copy mismatch req=%s after ready_event; retrying",
             rid,
         )
         dst.copy_(src, non_blocking=False)
@@ -1021,6 +1044,7 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         if stream is None:
             stream = torch.npu.Stream()
             self._lwd_h2d_copy_stream = stream
+            self._lwd_h2d_verified = False
         return stream
 
     def _lwd_window_device(self, numel: int, min_depth: int = _LWD_WINDOW_MIN_DEPTH) -> tuple[torch.Tensor, int]:
@@ -1069,11 +1093,9 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
             raise RuntimeError(f"[Lwd][cloud-runner] invalid host window for {window.req_id}")
         req = stager.take_req(window.req_id)
         assert req is not None
-        # Cold-start first-window silent copy loss: verify + retry (see helper).
-        self._lwd_h2d_copy_verified(
-            dev[elem_offset : elem_offset + numel],
+        dev[elem_offset : elem_offset + numel].copy_(
             req.host[host_start : host_start + numel],
-            window.req_id,
+            non_blocking=True,
         )
 
     def _lwd_inject_remote_embeds(

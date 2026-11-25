@@ -213,6 +213,10 @@ class LwdEngramInputs:
     ) -> None:
         """Create the record on the first received chunk and fill the prompt tail.
 
+        Preemption may replay prompt chunks without changing the prompt or
+        image spans. Filled tail cells remain valid and are reused; only
+        missing cells are looked up, keeping replay idempotent on every rank.
+
         The first received chunk can start after zero when prefix caching covers
         the prompt prefix. The full-request spans are supplied on every call and
         are read only when creating the record. The tail is the last

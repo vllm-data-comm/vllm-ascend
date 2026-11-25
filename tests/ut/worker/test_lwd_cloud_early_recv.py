@@ -97,6 +97,7 @@ def load_worker_methods():
         "_early_recv_quota",
         "_pick_pending_locked",
         "_report_irecv_completions",
+        "_lwd_flush_pending_reports",
         "_lwd_up_post_recvs",
         "_lwd_cloud_flush_finished",
     }
@@ -201,7 +202,7 @@ class FakeDoneMq:
         self.items: list[object] = []
         self.on_enqueue = None
 
-    def enqueue(self, item: object) -> None:
+    def enqueue(self, item: object, timeout: float | None = None) -> None:
         self.items.append(item)
         if self.on_enqueue is not None:
             self.on_enqueue()
@@ -440,6 +441,7 @@ def test_submit_failure_abandons_device_allocation(worker) -> None:
     error = RuntimeError("submit failed")
     worker._data_plane.error = error
     start_early_irecv(worker, make_hint(0, ["a"], [2], [0], [4]))
+    worker._lwd_flush_pending_reports()
     assert worker._irecv_done_mqs[DEFAULT_CONNECTION].items == [(DEFAULT_CONNECTION, "error", 0, repr(error))]
     assert worker._lwd_stager.busy_slots() == []
     assert not worker._early_recv_pending
