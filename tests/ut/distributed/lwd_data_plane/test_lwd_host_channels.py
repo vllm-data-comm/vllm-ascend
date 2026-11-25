@@ -160,11 +160,6 @@ def _host_bootstrap(monkeypatch) -> None:
         raising=False,
     )
     monkeypatch.setattr(lwd_host_channels, "_resolve_up_block_mb", lambda: 8)
-    monkeypatch.setattr(
-        lwd_host_channels,
-        "_qos_data_plane",
-        lambda: SimpleNamespace(traffic_class=None, sl=None),
-    )
 
 
 def _init(monkeypatch, config: LwdConfig, *, dp_identity: tuple[int, int] = (0, 0)) -> None:

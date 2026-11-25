@@ -38,7 +38,7 @@ from typing import Any
 
 import torch
 from vllm.config import get_current_vllm_config
-from vllm.config.lwd.topology import LwdHostDataPlane, LwdQosDataPlane
+from vllm.config.lwd.layout import LwdHostPlane
 from vllm.distributed.parallel_state import get_tensor_model_parallel_rank
 from vllm.logger import logger
 from vllm.v1.lwd_comm.data_comm.ucx_channel import LwdUcxListener
@@ -126,22 +126,15 @@ def _hf_attr(cfg: Any, name: str) -> Any:
     return getattr(cfg, name, None)
 
 
-def _qos_data_plane() -> LwdQosDataPlane:
-    """The top-level ``qos.data_plane`` block of the topology, or an
-    empty default when omitted (UCX defaults then apply)."""
-    qos = get_current_vllm_config().lwd_config.topology.qos
-    if qos is None or qos.data_plane is None:
-        return LwdQosDataPlane()
-    return qos.data_plane
-
-
-def _host_plane() -> LwdHostDataPlane:
-    """The topology's ``deployment.data_plane_host`` block; every field
-    (and the block itself) is optional -- defaults apply when omitted."""
-    host_plane = get_current_vllm_config().lwd_config.topology.deployment.data_plane_host
-    if host_plane is None:
-        host_plane = LwdHostDataPlane()
-    return host_plane
+def _lwd_host_plane() -> LwdHostPlane:
+    """The host-plane facts the plan derived from this instance's topology."""
+    lwd_config = get_current_vllm_config().lwd_config
+    if lwd_config is None:
+        raise RuntimeError("[LWD] the host data plane requires lwd_config")
+    plane = lwd_config.plan.plane
+    if not isinstance(plane, LwdHostPlane):
+        raise RuntimeError(f"[LWD] the host data plane requires data_plane_comm=host, got plane={type(plane).__name__}")
+    return plane
 
 
 def _resolve_up_block_mb() -> int:
@@ -177,7 +170,7 @@ def _resolve_up_block_mb() -> int:
             num_hash_layers=attr("num_hash_layers") or 0,
             num_experts_per_tok=attr("num_experts_per_tok") or 0,
             max_num_batched_tokens=max_num_batched_tokens,
-            explicit_up_block_mb=_host_plane().up_buffer_size,
+            explicit_up_block_mb=_lwd_host_plane().buffers.up_buffer_size,
         )
     except ucx_block_policy.LwdUcxBlockPolicyError as exc:
         raise RuntimeError(f"[LWD] host UP block auto-sizing failed: {exc}") from exc
@@ -241,15 +234,17 @@ def lwd_init_host_channels() -> None:
     # as the scheduler, control plane and queue consumers do. A per-instance
     # view here would leave the other frontends' connections without IO and
     # fail their submits with "no host send IO".
-    connections = lwd_config.connections
+    plan = lwd_config.plan
+    host_plane = _lwd_host_plane()
+    connections = plan.connections
     if not connections:
         raise RuntimeError(f"[LWD] no DP connections for role={role} instance={instance_id}")
     dp_rank, tp_rank = _my_dp_identity()
     up_block_mb = _resolve_up_block_mb()
-    down_block_mb = _host_plane().down_buffer_size
+    down_block_mb = host_plane.buffers.down_buffer_size
     # Sidecar deployment: a dedicated transport daemon owns the listeners and
     # engines ATTACH through the ctl socket ("daemon" mode of open_transport).
-    _sidecar = _host_plane().deployment == "sidecar"
+    _sidecar = host_plane.buffers.deployment == "sidecar"
 
     # Host memory budget gate: every link owns one pool of BLOCKS_PER_CHANNEL
     # blocks (a send direction reuses its channel's pool as D2H staging, no
@@ -280,18 +275,19 @@ def lwd_init_host_channels() -> None:
         limit_mb,
     )
 
-    qos = _qos_data_plane()
+    qos = host_plane.qos
     for conn in endpoint_conns:
         connection = conn.connection_id
-        if conn.cloud.data_port is None:
+        endpoint = host_plane.endpoint_of(connection)
+        if endpoint.data_port is None:
             raise RuntimeError(
                 f"[LWD] host data plane requires 'data_port' on the cloud DP "
                 f"(cloud={connection.cloud_id}, dp_idx={connection.dp_idx}); set it in "
                 "the topology file (edges never listen; ctrl_port is "
                 "control-plane only)"
             )
-        addr = conn.cloud.addr
-        port = conn.cloud.data_port  # used exactly as configured
+        addr = endpoint.addr
+        port = endpoint.data_port  # used exactly as configured
         # Cloud DP: one listener shared by every connection of that DP;
         # both links (UP recv / DOWN send) attach to it via serve_via,
         # token-routed. A second edge of the same DP must REUSE it: the
@@ -351,7 +347,7 @@ def lwd_init_host_channels() -> None:
     if role == "cloud" and _sidecar:
         logger.info(
             "[LWD] host sidecar deployment: listeners owned by the transport daemon (ports %s)",
-            sorted({conn.cloud.data_port for conn in endpoint_conns}),
+            sorted({host_plane.endpoint_of(conn.connection_id).data_port for conn in endpoint_conns}),
         )
     logger.info(
         "[LWD] host data-plane links created for role=%s instance=%d dp_rank=%d tp_rank=%d (ios=%s)",
