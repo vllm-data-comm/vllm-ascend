@@ -70,6 +70,7 @@ if TYPE_CHECKING:
 
 
 _LWD_H2D_VERIFY_ELEMENTS = 16
+_LWD_H2D_VERIFY_CHUNK_ELEMENTS = 1 << 20
 _LWD_WINDOW_MIN_DEPTH = 2
 
 
@@ -991,9 +992,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         self-heals afterwards, no error anywhere.
 
         The check compares the first 16 destination elements with the same
-        source elements, including matching NaNs. A full-buffer absolute-sum
-        guard also catches a dropped copy that leaves dst all-zero while src
-        is non-zero, even when their head samples are both zero.
+        source elements, including matching NaNs. A chunked non-zero guard
+        also catches a dropped copy that leaves dst all-zero while src is
+        non-zero, even when their head samples are both zero, without a
+        full-window reduction and its unbounded workspace on NPU.
         ``strict=False`` is for the expert-ID tail: retry once but never fail
         because zero expert-ID bytes are legitimate. Verification runs for
         the first window on each H2D stream.
@@ -1005,10 +1007,16 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         dst_sample = dst[:_LWD_H2D_VERIFY_ELEMENTS]
         src_sample = src[:_LWD_H2D_VERIFY_ELEMENTS]
 
+        def has_nonzero(tensor: torch.Tensor) -> bool:
+            for chunk in tensor.reshape(-1).split(_LWD_H2D_VERIFY_CHUNK_ELEMENTS):
+                if torch.any(chunk != 0).item():
+                    return True
+            return False
+
         def samples_match() -> bool:
             # If src is non-zero, a dropped copy that leaves dst all-zero is
             # a failure even when both head-16 samples are zero.
-            if float(src.abs().sum()) != 0.0 and float(dst.abs().sum()) == 0.0:
+            if has_nonzero(src) and not has_nonzero(dst):
                 return False
             try:
                 if torch.equal(dst_sample, src_sample):

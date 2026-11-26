@@ -358,6 +358,23 @@ class TestH2DVerifyAfterReady(unittest.TestCase):
         self.assertEqual(dst.non_blocking, [False])
         self.logger.warning.assert_called_once()
 
+    def test_zero_guard_bounds_each_reduction_chunk(self):
+        src = FakeCopyTensor(torch.cat([torch.zeros(16), torch.arange(1, 10)]))
+        dst = FakeCopyTensor(torch.zeros(25))
+        globals_ = self.runner._lwd_h2d_verify_after_ready.__globals__
+
+        with (
+            patch.dict(globals_, {"_LWD_H2D_VERIFY_CHUNK_ELEMENTS": 4}),
+            patch("torch.any", wraps=torch.any) as any_,
+        ):
+            self.verify(src, dst)
+
+        chunk_sizes = [call.args[0].numel() for call in any_.call_args_list]
+        self.assertTrue(chunk_sizes)
+        self.assertLessEqual(max(chunk_sizes), 4)
+        self.assertGreater(len(chunk_sizes), 2)
+        self.assertTrue(torch.equal(dst.value, src.value))
+
     def test_completed_async_copy_passes_without_retry(self):
         samples = (
             torch.zeros(4),
