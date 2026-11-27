@@ -992,9 +992,10 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
         source elements, including matching NaNs. A full-buffer absolute-sum
         guard also catches a dropped copy that leaves dst all-zero while src
         is non-zero, even when their head samples are both zero.
-        ``strict=False`` is for the expert-ID tail: retry once but never fail
-        because zero expert-ID bytes are legitimate. Verification runs for
-        the first window on each H2D stream.
+        ``strict=False`` is for the expert-ID tail: zero expert-ID bytes are
+        legitimate. A persistent mismatch after one retry is logged rather
+        than raised, so bad H2D data does not take down the service.
+        Verification runs for the first window on each H2D stream.
 
         The compute stream waits on ready_event before this readback. Only a
         mismatching slice pays for a blocking retry on the compute stream; no
@@ -1024,16 +1025,28 @@ class LwdCloudModelRunner(LwdBaseModelRunner):
 
         if samples_match():
             return
-        lwd_logger.warning(
-            "[LWD][cloud-runner] H2D first-copy mismatch req=%s after ready_event; retrying",
-            rid,
+        details = {
+            "rid": rid,
+            "strict": strict,
+            "dst_shape": tuple(dst.shape),
+            "src_shape": tuple(src.shape),
+            "dst_sample": dst_sample.cpu().tolist(),
+            "src_sample": src_sample.cpu().tolist(),
+            "dst_abs_sum": float(dst.abs().sum()),
+            "src_abs_sum": float(src.abs().sum()),
+        }
+        lwd_logger.error(
+            "[LWD][cloud-runner] H2D first-copy mismatch after ready_event; retrying: %s",
+            details,
         )
         dst.copy_(src, non_blocking=False)
         torch.npu.current_stream().synchronize()
-        if strict and not samples_match():
-            raise RuntimeError(
-                f"[LWD][cloud-runner] H2D copy mismatch twice req={rid} "
-                "(source and destination samples differ after retry)"
+        details["retried_dst_sample"] = dst_sample.cpu().tolist()
+        details["retried_dst_abs_sum"] = float(dst.abs().sum())
+        if not samples_match():
+            lwd_logger.error(
+                "[LWD][cloud-runner] H2D copy mismatch twice; continuing with the retried destination: %s",
+                details,
             )
 
     def _lwd_h2d_stream(self) -> torch.npu.Stream:

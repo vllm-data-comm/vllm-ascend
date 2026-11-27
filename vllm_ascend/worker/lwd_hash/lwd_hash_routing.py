@@ -50,8 +50,13 @@ class LwdHashRoutingState:
         end = start + ids.shape[0]
         if not 0 <= start <= end <= prompt_len:
             raise ValueError(f"Invalid LWD expert chunk for {req_id}: [{start}, {end})/{prompt_len}")
-        if torch.any(ids < 0) or torch.any(ids >= self.num_experts):
-            raise ValueError(f"LWD expert IDs out of range for {req_id}")
+        invalid = (ids < 0) | (ids >= self.num_experts)
+        if torch.any(invalid):
+            raise ValueError(
+                f"LWD expert IDs out of range for {req_id}: "
+                f"values={ids[invalid].tolist()} positions={torch.nonzero(invalid).tolist()} "
+                f"chunk=[{start}, {end})/{prompt_len} num_experts={self.num_experts}"
+            )
         entry = self.requests.get(req_id)
         if entry is None or entry[0].shape[0] != prompt_len:
             entry = (

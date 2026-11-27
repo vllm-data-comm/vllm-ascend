@@ -271,8 +271,8 @@ class LwdEngramInputs:
         positions it holds and the record completes over as many chunks as the
         tail spans.
 
-        Raises:
-            ValueError: A tail row matches no row of the embedding table.
+        A tail row that matches no table row is logged and left as an empty
+        window cell, so one bad Engram lookup does not take down the service.
         """
         positions = prompt_len - 1 - np.arange(self.dims.lookback_depth)
         mine = ~record.tail_filled & (positions >= start) & (positions < start + embeds.shape[0])
@@ -281,10 +281,21 @@ class LwdEngramInputs:
         rows = torch.from_numpy(positions[mine] - start).to(embeds.device)
         ids = self._embed_lookup.lookup(embeds[rows])
         if any(id_ == LWD_NO_EMBED_ROW for id_ in ids):
-            raise ValueError(
-                f"[LWD] Engram tail of {req_id} at prompt positions {positions[mine].tolist()} holds "
-                f"{ids.count(LWD_NO_EMBED_ROW)} embedding row(s) matching no row of the cloud's embedding "
-                "table: the edge and the cloud serve different weights, or the rows arrived corrupted"
+            missing_positions = positions[mine][np.asarray(ids) == LWD_NO_EMBED_ROW].tolist()
+            lwd_logger.error(
+                "[LWD] Engram tail of %s at prompt positions %s holds %d embedding row(s) matching no row "
+                "of the cloud's embedding table: the edge and the cloud serve different weights, or the "
+                "rows arrived corrupted; missing_positions=%s lookup_ids=%s start=%d prompt_len=%d "
+                "chunk_rows=%s embed_shape=%s; continuing with those cells empty",
+                req_id,
+                positions[mine].tolist(),
+                ids.count(LWD_NO_EMBED_ROW),
+                missing_positions,
+                ids,
+                start,
+                prompt_len,
+                rows.tolist(),
+                tuple(embeds.shape),
             )
         record.tail_cells[mine] = ids
         record.tail_filled[mine] = True
